@@ -1,0 +1,52 @@
+# --- Claude Flow scratch ---
+.claude-flow/
+.swarm/
+.hive-mind/
+memory/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+venv-*/
+.uv/
+.python-version
+
+# --- Model / training artifacts (generated on the server, never commit) ---
+checkpoints/
+runs/
+outputs/
+logs/
+wandb/
+*.log
+*.pt
+*.bin
+*.safetensors
+*.gguf
+*.ckpt
+hf_cache/
+.cache/
+datasets_cache/
+
+# --- Audio / data (generated) ---
+data/
+audio_out/
+*.wav
+*.flac
+*.mp3
+*.npy
+*.arrow
+
+# --- Benchmark results (regenerated) ---
+bench_results/
+*.bench.json
+
+# --- Secrets ---
+.env
+*.token
+hf_token.txt
+
+# --- OS ---
+.DS_Store
