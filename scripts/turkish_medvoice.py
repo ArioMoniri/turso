@@ -403,14 +403,18 @@ def _heal_tts_ports():
 # PERMANENT (the user must fix), never retried.
 _FATAL_ERR_NAMES = {
     "RepositoryNotFoundError", "GatedRepoError", "EntryNotFoundError",
-    "RevisionNotFoundError", "LocalEntryNotFoundError", "FileNotFoundError",
+    "RevisionNotFoundError", "FileNotFoundError",
     "NotADirectoryError", "PermissionError", "DatasetNotFoundError",
     "HFValidationError", "IsADirectoryError",
 }
-# transient network error TYPES (classified by type, not brittle substrings)
+# transient network error TYPES (classified by type, not brittle substrings).
+# LocalEntryNotFoundError is here (not fatal): hf_hub raises it when the Hub is
+# unreachable AND the file isn't cached yet — i.e. a transient outage on a cold
+# cache, which we want to retry, not surface.
 _NET_ERR_NAMES = {
     "ConnectionError", "Timeout", "ReadTimeout", "ConnectTimeout", "SSLError",
     "ChunkedEncodingError", "IncompleteRead", "ProtocolError", "HfHubHTTPError",
+    "LocalEntryNotFoundError",
 }
 
 
@@ -2583,8 +2587,20 @@ def cmd_auto(args):
         if step == "eval:all":
             cmd_eval(_ap.Namespace(suite="all", limit=args.limit, baselines=[]))
             res = read_json(Path(CFG.bench_dir) / "results.json", {}) or {}
+
+            def _errored(v):
+                if not isinstance(v, dict):
+                    return False
+                if v.get("error"):
+                    return True
+                # a suite that is a dict-of-subresults (e.g. latency's native/
+                # cascade, or asr's per-model rows) is errored iff EVERY sub-dict
+                # errored — so it can't silently count as a passing suite.
+                subs = [sv for sv in v.values() if isinstance(sv, dict)]
+                return bool(subs) and all(sv.get("error") for sv in subs)
+
             suites = [k for k in res if not k.startswith("_")]
-            ok = any(not (isinstance(res[k], dict) and res[k].get("error")) for k in suites)
+            ok = any(not _errored(res[k]) for k in suites)
             if not ok:
                 log("[auto] every eval suite errored — NOT marking eval done.", err=True)
             return ok
