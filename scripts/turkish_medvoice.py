@@ -352,7 +352,8 @@ _IMPORT_TO_PKG = {
     "requests": "requests", "multipart": "python-multipart",
     "omnivoice": "omnivoice", "vllm": "vllm>=0.17", "trnorm": "trnorm",
     "utmosv2": "git+https://github.com/sarulab-speech/UTMOSv2.git",
-    "flash_attn": "flash-attn>=2.7.0",
+    "flash_attn": "flash-attn>=2.7.0", "torchcodec": "torchcodec",
+    "phonemizer": "phonemizer", "torchmetrics.audio": "torchmetrics[audio]",
 }
 
 # Emergency-degradation ladder (applied CUMULATIVELY at startup from
@@ -455,10 +456,19 @@ def _pkg_for_import(exc):
     """Return (pip_spec_or_None, modname). Only WHITELISTED modules yield a spec;
     an unknown module returns (None, modname) so we never install an arbitrary
     package name parsed out of an (attacker-influenceable) error string."""
+    import re
     msg = str(exc)
     modname = ""
-    if "No module named" in msg:
-        modname = msg.split("No module named", 1)[1].strip().strip("'\"").split(".")[0]
+    m = re.search(r"No module named ['\"]?([\w\-.]+)", msg)
+    if m:
+        modname = m.group(1).split(".")[0]
+    else:
+        # libs that raise a plain ImportError telling you to `install 'X'`
+        # (e.g. datasets: "please install 'torchcodec'"). Only whitelisted names
+        # below yield a spec, so this cannot install something arbitrary.
+        m = re.search(r"install ['\"`]([\w\-.\[\]]+)['\"`]", msg)
+        if m:
+            modname = m.group(1).split("[")[0].split("==")[0]
     return _IMPORT_TO_PKG.get(modname), modname   # unmapped -> None (refuse to install)
 
 
@@ -1314,13 +1324,68 @@ def cmd_data(args):
     log("=== DATA DONE ===")
 
 
-def _hf_load(repo, config=None, split=None, streaming=True):
+def _hf_load(repo, config=None, split=None, streaming=True, audio_col=None):
     def _do():
         from datasets import load_dataset
-        return load_dataset(repo, config, split=split, streaming=streaming,
-                            cache_dir=CFG.hf_cache, trust_remote_code=True)
+        ds = load_dataset(repo, config, split=split, streaming=streaming,
+                          cache_dir=CFG.hf_cache, trust_remote_code=True)
+        if audio_col:
+            # Decode audio OURSELVES (soundfile/librosa) rather than via datasets'
+            # torchcodec backend: datasets>=4 dropped the soundfile decoder and
+            # raises "please install 'torchcodec'". decode=False hands us raw bytes.
+            try:
+                from datasets import Audio
+                ds = ds.cast_column(audio_col, Audio(decode=False))
+            except Exception as e:
+                log(f"  cast_column({audio_col}, decode=False) failed ({e}); "
+                    "will try native decoding.", err=True)
+        return ds
     # network transience (HF hub timeouts / 5xx / rate limits) auto-retries with backoff
     return resilient(_do, retries=5, base_delay=4.0, context=f"hf_load:{repo}")
+
+
+def _decode_audio_field(field):
+    """Decode a HF audio field to (float32 mono ndarray, sr) WITHOUT torchcodec.
+    Handles decoded dicts ({'array','sampling_rate'}), decode=False dicts
+    ({'bytes','path'}) and plain paths; mp3/opus fall back to librosa+ffmpeg."""
+    import io
+    import os as _os
+    import tempfile
+    import numpy as np
+    import soundfile as sf
+    import librosa
+
+    def _mono(a):
+        a = np.asarray(a, dtype="float32")
+        return a.mean(axis=1) if a.ndim > 1 else a
+
+    if isinstance(field, dict):
+        if field.get("array") is not None:
+            return _mono(field["array"]), int(field.get("sampling_rate", 16000))
+        raw, path = field.get("bytes"), field.get("path")
+        if raw:
+            try:
+                a, sr = sf.read(io.BytesIO(raw), dtype="float32")
+                return _mono(a), sr
+            except Exception:
+                suf = _os.path.splitext(path or "")[1] or ".mp3"
+                with tempfile.NamedTemporaryFile(suffix=suf, delete=False) as tf:
+                    tf.write(raw); tmp = tf.name
+                try:
+                    a, sr = librosa.load(tmp, sr=None, mono=True)   # uses ffmpeg
+                    return a.astype("float32"), sr
+                finally:
+                    try:
+                        _os.remove(tmp)
+                    except Exception:
+                        pass
+        if path:
+            a, sr = librosa.load(path, sr=None, mono=True)
+            return a.astype("float32"), sr
+    elif isinstance(field, str):
+        a, sr = librosa.load(field, sr=None, mono=True)
+        return a.astype("float32"), sr
+    raise ValueError("unrecognized audio field")
 
 
 def _build_align_manifest(cfg):
@@ -1341,7 +1406,7 @@ def _build_align_manifest(cfg):
         if written >= target:
             break
         try:
-            ds = _hf_load(repo, conf, split, streaming=True)
+            ds = _hf_load(repo, conf, split, streaming=True, audio_col=acol)
         except Exception as e:
             log(f"  {repo} load failed: {e}", err=True)
             continue
@@ -1602,19 +1667,10 @@ def _split_dialogue(text):
 
 def _dump_audio(audio_field, root, idx):
     """Persist a HF audio field to a 16 kHz mono wav; return path or None."""
-    import numpy as np
     import soundfile as sf
     import librosa
     try:
-        if isinstance(audio_field, dict) and "array" in audio_field:
-            arr = np.asarray(audio_field["array"], dtype="float32")
-            sr = int(audio_field.get("sampling_rate", 16000))
-        elif isinstance(audio_field, dict) and audio_field.get("path"):
-            arr, sr = librosa.load(audio_field["path"], sr=16000, mono=True)
-        elif isinstance(audio_field, str):
-            arr, sr = librosa.load(audio_field, sr=16000, mono=True)
-        else:
-            return None
+        arr, sr = _decode_audio_field(audio_field)      # torchcodec-free decoder
         if sr != 16000:
             arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
             sr = 16000
@@ -2269,12 +2325,12 @@ def args_has_baseline(name):
 
 
 def _load_fleurs_tr(cfg, limit):
-    ds = _hf_load(cfg.fleurs_repo, "tr_tr", "test", streaming=True)
+    ds = _hf_load(cfg.fleurs_repo, "tr_tr", "test", streaming=True, audio_col="audio")
     refs, wavs = [], []
     for ex in ds:
         refs.append(str(ex.get("transcription") or ex.get("raw_transcription") or ""))
-        a = ex["audio"]
-        wavs.append(_to16k(a["array"], a["sampling_rate"]))
+        arr, sr = _decode_audio_field(ex["audio"])          # torchcodec-free
+        wavs.append(_to16k(arr, sr))
         if len(refs) >= limit:
             break
     return refs, wavs
