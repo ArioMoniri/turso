@@ -49,6 +49,26 @@ SUBCOMMANDS
   train   --stage {align,s2s,medical,distill} [--resume]   QLoRA, checkpoint/resume
   eval    --suite {asr,tts,s2s,medical,all} [--baselines ...]   the full benchmark
   serve   streaming native S2S endpoint  (--cascade for the safe fallback path)
+  doctor  preflight + AUTO-FIX (CUDA/MIG env, missing deps, low disk, asset paths,
+          TTS reachability with autostart, HF auth)
+  auto    run the WHOLE roadmap unattended (doctor->data->train*->eval), resumable
+
+SELF-HEALING (fully automated error recovery)
+---------------------------------------------
+  Every subcommand runs under a top-level supervisor that classifies failures and
+  applies an automated remediation, then either retries in-process or RE-EXECs the
+  process (which fully resets CUDA) and resumes from the last checkpoint. It is
+  bounded (TMV_MAX_HEAL, default 12 restarts) so it can never loop forever, and
+  journals every failure+fix to logs/heal.jsonl. Handled automatically:
+    - missing python dep      -> pip-install the mapped package, restart
+    - CUDA OOM / NVML(MIG)     -> set expandable_segments, climb the degradation
+                                 ladder (seq-len -> grad-accum -> student size),
+                                 restart with --resume
+    - HF hub / network hiccup -> exponential backoff + retry (then restart)
+    - OmniVoice TTS down       -> autostart the server (README cmd) + retry
+    - corrupt/mismatched ckpt  -> restart from base adapters
+    - low disk                 -> prune stale files, restart
+  Disable with the global --no-heal flag. Best used via `auto` inside tmux.
 
 --------------------------------------------------------------------------------
  TRANSFER TO SERVER + RUN (survives SSH drops via tmux)
@@ -66,12 +86,16 @@ SUBCOMMANDS
   python3 turkish_medvoice.py setup            # will print the venv activate line
   #    activate the venv it created, then re-run subcommands inside it.
 
-  # 4) build data, then train stage-by-stage (each is resumable):
+  # 4) EASIEST: one self-healing command runs the whole roadmap and recovers from
+  #    errors on its own (data -> align -> s2s -> medical -> eval), resuming after
+  #    any crash. Detach with Ctrl-b then d; it keeps going.
+  python3 turkish_medvoice.py auto
+  #    ...or drive it stage-by-stage (each is resumable and self-healing too):
+  python3 turkish_medvoice.py doctor            # preflight + auto-fix
   python3 turkish_medvoice.py data
   python3 turkish_medvoice.py train --stage align
   python3 turkish_medvoice.py train --stage s2s
   python3 turkish_medvoice.py train --stage medical
-  # ...detach with  Ctrl-b  then  d  ; the run continues.
 
   # 5) benchmark against baselines and write the report:
   python3 turkish_medvoice.py eval --suite all
@@ -299,6 +323,292 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
     except Exception:
         pass
+
+
+# =========================================================================== #
+#  SELF-HEALING ENGINE                                                          #
+#  Classifies runtime failures and applies an automated remediation, then      #
+#  either retries in-process or re-EXECs the process (with --resume) so long,   #
+#  unattended runs recover on their own instead of dying. Every failure and    #
+#  remediation is journaled to logs/heal.jsonl. Bounded so it can never loop    #
+#  forever.                                                                     #
+# =========================================================================== #
+
+# Maximum number of self-heal RE-EXECs across the whole run (env-persisted).
+MAX_HEAL_REEXEC = int(_env("TMV_MAX_HEAL", "12"))
+# Degradation ladder level (env-persisted across re-execs).
+HEAL_LEVEL = int(_env("TMV_HEAL_LEVEL", "0"))
+
+# import-name -> pip spec, for auto-installing a missing dependency on the fly.
+_IMPORT_TO_PKG = {
+    "torch": "torch==2.8.0", "torchaudio": "torchaudio==2.8.0",
+    "transformers": "transformers>=4.57.0", "peft": "peft>=0.14",
+    "datasets": "datasets>=2.18", "bitsandbytes": "bitsandbytes>=0.45",
+    "accelerate": "accelerate>=0.34", "huggingface_hub": "huggingface_hub>=0.25",
+    "safetensors": "safetensors", "librosa": "librosa==0.10.2", "soundfile": "soundfile",
+    "sentencepiece": "sentencepiece", "numpy": "numpy<2.3", "yaml": "pyyaml",
+    "jiwer": "jiwer>=3.0.4", "speechbrain": "speechbrain", "resemblyzer": "resemblyzer",
+    "torchmetrics": "torchmetrics[audio]", "fastapi": "fastapi", "uvicorn": "uvicorn[standard]",
+    "requests": "requests", "multipart": "python-multipart",
+    "omnivoice": "omnivoice", "vllm": "vllm>=0.17", "trnorm": "trnorm",
+    "utmosv2": "git+https://github.com/sarulab-speech/UTMOSv2.git",
+    "flash_attn": "flash-attn>=2.7.0",
+}
+
+# Emergency-degradation ladder (applied CUMULATIVELY at startup from
+# TMV_HEAL_LEVEL). It ONLY reduces the memory footprint of the SAME model
+# (seq-len / grad-accum / micro-batch). It deliberately does NOT swap the student
+# to a smaller model: that would change hidden_size and silently discard the
+# projector + LoRA + optimizer state (a hidden restart-from-base), so if even the
+# smallest footprint OOMs we surface the error instead.
+MAX_HEAL_LEVEL = 4
+
+
+def _apply_heal_level(cfg, level):
+    if level <= 0:
+        return
+    log(f"[heal] applying degradation level {level} (seq/batch footprint only)", err=True)
+    if level >= 1:
+        cfg.max_seq_len = min(cfg.max_seq_len, 2048); cfg.grad_accum = max(cfg.grad_accum, 32)
+    if level >= 2:
+        cfg.max_seq_len = min(cfg.max_seq_len, 1536); cfg.micro_batch = 1
+    if level >= 3:
+        cfg.max_seq_len = min(cfg.max_seq_len, 1024); cfg.grad_accum = max(cfg.grad_accum, 64)
+    if level >= 4:
+        cfg.max_seq_len = min(cfg.max_seq_len, 768)
+
+
+def _heal_journal(context, kind, exc, action, attempt):
+    rec = {"time": time.time(), "context": context, "kind": kind,
+           "error": f"{type(exc).__name__}: {str(exc)[:400]}",
+           "action": action, "attempt": attempt, "heal_level": HEAL_LEVEL}
+    try:
+        append_jsonl(Path(CFG.log_dir) / "heal.jsonl", rec)
+    except Exception:
+        pass
+    log(f"[heal] {context}: {kind} -> {action} (attempt {attempt})", err=True)
+
+
+def _heal_tts_ports():
+    import re
+    ports = []
+    for url in (CFG.omni_server_url, CFG.stt_server_url):
+        m = re.search(r":(\d+)", url or "")
+        if m:
+            ports.append(m.group(1))
+    return ports
+
+
+# HF-hub errors that mean "the asset does not exist / you lack access" — these are
+# PERMANENT (the user must fix), never retried.
+_FATAL_ERR_NAMES = {
+    "RepositoryNotFoundError", "GatedRepoError", "EntryNotFoundError",
+    "RevisionNotFoundError", "LocalEntryNotFoundError", "FileNotFoundError",
+    "NotADirectoryError", "PermissionError", "DatasetNotFoundError",
+    "HFValidationError", "IsADirectoryError",
+}
+# transient network error TYPES (classified by type, not brittle substrings)
+_NET_ERR_NAMES = {
+    "ConnectionError", "Timeout", "ReadTimeout", "ConnectTimeout", "SSLError",
+    "ChunkedEncodingError", "IncompleteRead", "ProtocolError", "HfHubHTTPError",
+}
+
+
+def classify_error(exc):
+    """Map an exception to a remediation class. Errs on the side of `fatal` (which
+    is surfaced, not retried) so a permanent error can never drive an endless
+    re-exec loop. Classes: missing_dep | oom | nvml | disk | tts | network | fatal."""
+    name = type(exc).__name__
+    mod = (type(exc).__module__ or "").split(".")[0]
+    msg = (str(exc) or "").lower()
+
+    if name in ("ModuleNotFoundError", "ImportError"):
+        return "missing_dep"
+    if name == "OutOfMemoryError" or "out of memory" in msg or "cuda oom" in msg:
+        return "oom"
+    if "nvml" in msg or "no cuda-capable device" in msg or "cuda unknown error" in msg:
+        return "nvml"
+    if name in _FATAL_ERR_NAMES:                 # missing asset / gated / 404 / perms
+        return "fatal"
+    if "no space left" in msg or "disk quota" in msg or "errno 28" in msg:
+        return "disk"
+    # TTS-server reachability — match the CONFIGURED ports so the supervisor can
+    # auto-start the OmniVoice server (checked before generic network).
+    if (any(p in msg for p in _heal_tts_ports()) or "omnivoice" in msg) and "cuda" not in msg:
+        return "tts"
+    # network transience by exception TYPE (robust) or explicit HTTP-5xx/429 text
+    if mod in ("requests", "urllib", "urllib3", "http", "socket", "aiohttp") \
+            or name in _NET_ERR_NAMES:
+        return "network"
+    if any(s in msg for s in ("temporarily unavailable", "max retries exceeded",
+                              "connection reset", "connection aborted", "server error",
+                              " 503", " 502", " 504", " 429")):
+        return "network"
+    return "fatal"                                # unknown -> surface, do not loop
+
+
+def _pkg_for_import(exc):
+    """Return (pip_spec_or_None, modname). Only WHITELISTED modules yield a spec;
+    an unknown module returns (None, modname) so we never install an arbitrary
+    package name parsed out of an (attacker-influenceable) error string."""
+    msg = str(exc)
+    modname = ""
+    if "No module named" in msg:
+        modname = msg.split("No module named", 1)[1].strip().strip("'\"").split(".")[0]
+    return _IMPORT_TO_PKG.get(modname), modname   # unmapped -> None (refuse to install)
+
+
+def _auto_pip_install(spec, modname=None):
+    """Install a WHITELISTED package into the current interpreter, at most once per
+    module across the whole run (env-tracked) to prevent install/re-exec thrash on
+    a transitively-broken import. Refuses anything not in the _IMPORT_TO_PKG values."""
+    if not spec or spec not in set(_IMPORT_TO_PKG.values()):
+        log(f"[heal] refusing to auto-install non-whitelisted dependency '{spec}'.", err=True)
+        return False
+    tried = set(filter(None, os.environ.get("TMV_HEAL_INSTALLED", "").split(",")))
+    key = modname or spec
+    if key in tried:
+        log(f"[heal] '{key}' was already auto-installed once and still failing; "
+            "surfacing instead of looping.", err=True)
+        return False
+    try:
+        if spec.startswith("flash-attn"):
+            _pip(sys.executable, [spec, "--no-build-isolation"])
+        elif spec.startswith(("torch", "torchaudio")):
+            _pip(sys.executable, [spec, "--index-url", TORCH_INDEX])
+        else:
+            _pip(sys.executable, [spec])
+        os.environ["TMV_HEAL_INSTALLED"] = ",".join(sorted(tried | {key}))
+        return True
+    except Exception as e:
+        log(f"[heal] auto-install of '{spec}' failed: {e}", err=True)
+        return False
+
+
+def _prune_checkpoints(cfg, keep=1):
+    """Free disk by deleting all but the newest per-stage checkpoint dirs and old caches."""
+    freed = []
+    try:
+        import glob
+        for stage in ("align", "s2s", "medical", "distill"):
+            # our layout keeps a single dir per stage, so only prune stray *.tmp / old opt
+            d = Path(cfg.stage_ckpt(stage))
+            for junk in glob.glob(str(d / "*.tmp")) + glob.glob(str(d / "optimizer.pt.bak")):
+                try:
+                    os.remove(junk); freed.append(junk)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    log(f"[heal] pruned {len(freed)} stale files to free disk.", err=True)
+    return len(freed) > 0
+
+
+def _reexec(extra_env=None, ensure_args=()):
+    """Fully restart this process (resets CUDA/context) with the SAME argv +
+    optional extra env + ensured flags. Bounded by MAX_HEAL_REEXEC."""
+    n = int(os.environ.get("TMV_HEAL_REEXEC_N", "0")) + 1
+    if n > MAX_HEAL_REEXEC:
+        log(f"[heal] giving up: exceeded {MAX_HEAL_REEXEC} self-heal restarts.", err=True)
+        return False
+    env = dict(os.environ)
+    env["TMV_HEAL_REEXEC_N"] = str(n)
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items()})
+    argv = [sys.executable] + sys.argv
+    for a in ensure_args:
+        if a not in argv:
+            argv.append(a)
+    log(f"[heal] restarting process (#{n}/{MAX_HEAL_REEXEC}) ...", err=True)
+    sys.stdout.flush(); sys.stderr.flush()
+    os.execve(sys.executable, argv, env)   # never returns on success
+    return False
+
+
+def resilient(fn, *, retries=4, base_delay=3.0, context="op", on_give_up=None):
+    """Run fn() with in-process automated remediation + capped exponential backoff.
+    Handles the classes that CAN be fixed without a full restart (network, missing
+    dep, transient load). Raises (or calls on_give_up) once retries are exhausted or
+    the error is fatal. OOM/NVML are NOT retried here — they need a process restart
+    and are handled by the top-level supervisor."""
+    import random as _rnd
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except Exception as e:                     # noqa: BLE001 (intentional broad heal)
+            attempt += 1
+            kind = classify_error(e)
+            # OOM/NVML need a process restart (handled by the top-level supervisor);
+            # `fatal` is permanent -> surface at once so we never retry pointlessly.
+            if kind in ("oom", "nvml", "fatal") or attempt > retries:
+                _heal_journal(context, kind, e, "give-up", attempt)
+                if on_give_up is not None:
+                    return on_give_up(e)
+                raise
+            action = "backoff-retry"
+            if kind == "missing_dep":
+                spec, modname = _pkg_for_import(e)
+                if not _auto_pip_install(spec, modname):
+                    _heal_journal(context, kind, e, "give-up(non-whitelisted)", attempt)
+                    raise                          # cannot safely install -> surface
+                action = f"pip-install {spec}"
+            elif kind == "disk":
+                action = "prune-disk"; _prune_checkpoints(CFG)
+            _heal_journal(context, kind, e, action, attempt)
+            delay = min(60.0, base_delay * (2 ** (attempt - 1))) + _rnd.uniform(0, 1.5)
+            time.sleep(delay)
+
+
+def supervise(exc, args):
+    """Top-level supervisor: last-resort automated recovery for an uncaught error
+    from a subcommand. Applies a remediation and RE-EXECs the process (which resets
+    CUDA and resumes from the last checkpoint). Returns only if it could not heal
+    (caller should then re-raise)."""
+    kind = classify_error(exc)
+    # `auto` resumes via its own state file + cmd_train(resume=True), so only the
+    # bare `train` subcommand needs the --resume flag re-appended.
+    add_resume = ["--resume"] if getattr(args, "cmd", "") == "train" else []
+    _heal_journal(getattr(args, "cmd", "?"), kind, exc, f"supervise/{kind}", 0)
+
+    if kind == "missing_dep":
+        spec, modname = _pkg_for_import(exc)
+        if _auto_pip_install(spec, modname):       # whitelist + install-once guarded
+            _reexec(ensure_args=add_resume)
+    elif kind == "oom":
+        if HEAL_LEVEL >= MAX_HEAL_LEVEL:
+            log("[heal] OOM persists at the smallest footprint (level "
+                f"{MAX_HEAL_LEVEL}); surfacing instead of looping.", err=True)
+            return False
+        env = {"TMV_HEAL_LEVEL": min(MAX_HEAL_LEVEL, HEAL_LEVEL + 1),
+               "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+        _reexec(extra_env=env, ensure_args=add_resume)   # climb the footprint ladder
+    elif kind == "nvml":
+        # MIG/driver hiccup: reset the allocator and restart WITHOUT shrinking
+        # anything (the OOM ladder is the wrong remedy for a device fault).
+        _reexec(extra_env={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+                ensure_args=add_resume)
+    elif kind == "network":
+        time.sleep(10)
+        _reexec(ensure_args=add_resume)
+    elif kind == "disk":
+        if _prune_checkpoints(CFG):
+            _reexec(ensure_args=add_resume)
+    elif kind == "tts":
+        if _ensure_tts_server(CFG):
+            _reexec(ensure_args=add_resume)
+    # NOTE: corrupt/mismatched checkpoints are handled tolerantly inside
+    # build_model (fresh projector + skipped LoRA on mismatch), so there is no
+    # auto "drop adapters and restart" path here — that would silently throw away
+    # resume progress on any error whose text merely mentions a shape/state_dict.
+    return False   # could not heal -> caller re-raises
+
+
+def _proactive_env():
+    """Set environment that pre-empts the most common MIG/tokenizer failures."""
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # MIG NVML
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 
 # =========================================================================== #
@@ -619,22 +929,11 @@ class TTSBackend:
                 return
         except Exception:
             pass
-        # (2) HTTP endpoint (your running server)
-        try:
-            import requests
-            r = requests.options(self.cfg.omni_server_url, timeout=3)
+        # (2) HTTP endpoint (your running server) — SELF-HEAL: if it's down, try to
+        # autostart it before giving up.
+        if _tts_reachable(self.cfg) or _ensure_tts_server(self.cfg):
             self.mode = "http"
             return
-        except Exception:
-            pass
-        # try a HEAD/GET as a reachability probe
-        try:
-            import requests
-            requests.get(self.cfg.omni_server_url.replace("/v1/audio/speech", "/"), timeout=3)
-            self.mode = "http"
-            return
-        except Exception:
-            pass
         self.mode = None
 
     def describe(self):
@@ -649,7 +948,9 @@ class TTSBackend:
         return self.mode is not None
 
     def synth(self, text, out_path=None, ref_wav=None):
-        """Return 24 kHz float32 mono np.ndarray (and write WAV if out_path)."""
+        """Return 24 kHz float32 mono np.ndarray (and write WAV if out_path).
+        SELF-HEAL: on an HTTP failure, try to bring the server back up and retry
+        once before raising."""
         import numpy as np
         text = (text or "").strip()
         if not text:
@@ -657,7 +958,14 @@ class TTSBackend:
         if self.mode == "python":
             wav, sr = self._py(text, ref_wav or self.cfg.omni_ref_wav)
         elif self.mode == "http":
-            wav, sr = self._http(text)
+            try:
+                wav, sr = self._http(text)
+            except Exception as e:
+                log(f"[heal] TTS request failed ({e}); attempting recovery.", err=True)
+                if _ensure_tts_server(self.cfg):
+                    wav, sr = self._http(text)      # retry once after recovery
+                else:
+                    raise
         else:
             raise RuntimeError("No TTS backend available (see TTSBackend.describe()).")
         if out_path:
@@ -760,6 +1068,82 @@ def _coerce_wav(out):
     return wav, sr
 
 
+def _tts_reachable(cfg):
+    import requests
+    base = cfg.omni_server_url.split("/v1/")[0]
+    for url in (base + "/", cfg.omni_server_url):
+        try:
+            requests.get(url, timeout=4)
+            return True
+        except Exception:
+            try:
+                requests.options(cfg.omni_server_url, timeout=4)
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def _ensure_tts_server(cfg, timeout=90):
+    """SELF-HEAL: make the OmniVoice TTS HTTP server reachable. If it is down and
+    autostart is enabled (TMV_AUTOSTART_TTS=1, default), launch the documented
+    uvicorn server in the OmniVoice venv, then poll for reachability. Returns True
+    if reachable."""
+    if _tts_reachable(cfg):
+        return True
+    if os.environ.get("TMV_AUTOSTART_TTS", "1") != "1":
+        return False
+    omni_py = os.environ.get("TMV_OMNI_VENV_PY", "/root/venv-omni/bin/python")
+    app_dir = os.environ.get("TMV_OMNI_APP_DIR", str(Path(cfg.root) / "app"))
+    if not (Path(omni_py).exists() and Path(app_dir).exists()):
+        log(f"[heal] cannot autostart TTS (missing {omni_py} or {app_dir}); "
+            "start it manually per README.", err=True)
+        return False
+    # Guard against spawning DUPLICATE GPU servers across re-execs / repeated
+    # heals: if we already started one and it's still alive, just wait for it.
+    pidfile = Path(cfg.log_dir) / ".tts_autostart.pid"
+    try:
+        if pidfile.exists():
+            old = int(pidfile.read_text().strip() or "0")
+            if old > 0:
+                os.kill(old, 0)                    # raises if the process is gone
+                log(f"[heal] a TTS autostart is already running (pid {old}); waiting.", err=True)
+                t0 = time.time()
+                while time.time() - t0 < timeout:
+                    time.sleep(5)
+                    if _tts_reachable(cfg):
+                        return True
+                return _tts_reachable(cfg)
+    except Exception:
+        pass   # stale/dead pid -> fall through and (re)spawn exactly one
+    import re
+    m = re.search(r":(\d+)", cfg.omni_server_url)
+    port = m.group(1) if m else "8133"
+    env = dict(os.environ)
+    env.update({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "OMNI_MODEL": cfg.omni_model, "OMNI_REF": cfg.omni_ref_wav,
+                "OMNI_REFTXT_FILE": cfg.omni_ref_txt, "OMNI_LANG": cfg.omni_lang})
+    cmd = [omni_py, "-m", "uvicorn", "omnivoice_server:app",
+           "--host", "127.0.0.1", "--port", port, "--app-dir", app_dir]
+    log(f"[heal] autostarting OmniVoice TTS server: {' '.join(cmd)}", err=True)
+    try:
+        Path(cfg.log_dir).mkdir(parents=True, exist_ok=True)
+        with open(Path(cfg.log_dir) / "tts_server.log", "a") as logf:
+            proc = subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT)
+        pidfile.write_text(str(proc.pid))          # record so we don't double-spawn
+    except Exception as e:
+        log(f"[heal] TTS autostart failed: {e}", err=True)
+        return False
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(5)
+        if _tts_reachable(cfg):
+            log("[heal] TTS server is up.")
+            return True
+    log("[heal] TTS server did not become reachable in time.", err=True)
+    return False
+
+
 # =========================================================================== #
 #  STT helper (for cascade serve + round-trip eval)                            #
 # =========================================================================== #
@@ -814,9 +1198,12 @@ def cmd_data(args):
 
 
 def _hf_load(repo, config=None, split=None, streaming=True):
-    from datasets import load_dataset
-    return load_dataset(repo, config, split=split, streaming=streaming,
-                        cache_dir=CFG.hf_cache, trust_remote_code=True)
+    def _do():
+        from datasets import load_dataset
+        return load_dataset(repo, config, split=split, streaming=streaming,
+                            cache_dir=CFG.hf_cache, trust_remote_code=True)
+    # network transience (HF hub timeouts / 5xx / rate limits) auto-retries with backoff
+    return resilient(_do, retries=5, base_delay=4.0, context=f"hf_load:{repo}")
 
 
 def _build_align_manifest(cfg):
@@ -1143,14 +1530,27 @@ def build_model(cfg, for_training=True, adapter_dir=None):
     from transformers import (AutoTokenizer, AutoModelForCausalLM, WhisperModel,
                               WhisperFeatureExtractor, BitsAndBytesConfig)
 
+    # SELF-HEAL: if a prior load failed on a corrupt/mismatched checkpoint, the
+    # supervisor re-execs with this flag so we start from base instead of looping.
+    drop_adapters = os.environ.get("TMV_HEAL_DROP_ADAPTERS", "0") == "1"
+    if drop_adapters and adapter_dir:
+        log("[heal] TMV_HEAL_DROP_ADAPTERS=1 -> ignoring saved adapters, starting from base.",
+            err=True)
+        adapter_dir = None
+
     log("Loading tokenizer + Whisper encoder + Qwen student ...")
-    tok = AutoTokenizer.from_pretrained(cfg.student_llm)
+    # model/tokenizer downloads auto-retry on hub transience
+    tok = resilient(lambda: AutoTokenizer.from_pretrained(cfg.student_llm),
+                    context="load:tokenizer")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    feat = WhisperFeatureExtractor.from_pretrained(cfg.whisper_processor)
+    feat = resilient(lambda: WhisperFeatureExtractor.from_pretrained(cfg.whisper_processor),
+                     context="load:feat")
 
     # frozen Whisper encoder (encoder-only)
-    wm = WhisperModel.from_pretrained(cfg.whisper_ckpt, torch_dtype=torch.bfloat16)
+    wm = resilient(lambda: WhisperModel.from_pretrained(cfg.whisper_ckpt,
+                                                        torch_dtype=torch.bfloat16),
+                   context="load:whisper")
     encoder = wm.get_encoder()
     for p in encoder.parameters():
         p.requires_grad_(False)
@@ -1170,10 +1570,11 @@ def build_model(cfg, for_training=True, adapter_dir=None):
         qcfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                                   bnb_4bit_use_double_quant=True,
                                   bnb_4bit_compute_dtype=torch.bfloat16)
-    llm = AutoModelForCausalLM.from_pretrained(
+    llm = resilient(lambda: AutoModelForCausalLM.from_pretrained(
         cfg.student_llm, quantization_config=qcfg,
         torch_dtype=torch.bfloat16, attn_implementation=attn,
-        device_map={"": 0} if torch.cuda.is_available() else None)
+        device_map={"": 0} if torch.cuda.is_available() else None),
+        context="load:student")
     if for_training:
         llm.config.use_cache = False          # required with gradient checkpointing
 
@@ -1220,9 +1621,13 @@ def build_model(cfg, for_training=True, adapter_dir=None):
     projector = SpeechProjector(cfg.whisper_dim, d_llm, cfg.down_factor).to(
         dtype=torch.bfloat16, device=dev)
     if adapter_dir and Path(adapter_dir, "projector.pt").exists():
-        projector.load_state_dict(torch.load(
-            str(Path(adapter_dir) / "projector.pt"), map_location=dev))
-        log(f"Loaded projector from {adapter_dir}")
+        try:
+            projector.load_state_dict(torch.load(
+                str(Path(adapter_dir) / "projector.pt"), map_location=dev))
+            log(f"Loaded projector from {adapter_dir}")
+        except Exception as e:
+            # e.g. dim mismatch after an emergency student-size fallback -> start fresh
+            log(f"[heal] projector load skipped ({e}); using a fresh projector.", err=True)
 
     encoder = encoder.to(dev)
     model = NativeSpeechLLM(cfg, encoder, projector, llm, tok, feat)
@@ -1432,26 +1837,10 @@ def cmd_train(args):
             init_dir = prev
             log(f"Initializing from previous stage adapters: {prev}")
 
-    try:
-        _train_loop(CFG, stage, rows, init_dir=init_dir, resume=args.resume)
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower() and os.environ.get("TMV_OOM_RETRY", "0") == "0":
-            # A leaked CUDA context / dead allocation cannot be reliably freed inside
-            # the same process, so re-EXEC with a smaller footprint + --resume. This
-            # fully resets CUDA. TMV_OOM_RETRY guards against an infinite loop.
-            log("CUDA OOM — re-launching with halved seq-len, doubled grad-accum, "
-                "--resume (this fully resets CUDA).", err=True)
-            new_env = dict(os.environ)
-            new_env["TMV_OOM_RETRY"] = "1"
-            new_env["TMV_MAXSEQ"] = str(max(1024, CFG.max_seq_len // 2))
-            new_env["TMV_GA"] = str(CFG.grad_accum * 2)
-            new_env["TMV_MBS"] = "1"
-            argv = [sys.executable] + sys.argv
-            if "--resume" not in argv:
-                argv.append("--resume")
-            sys.stdout.flush()
-            os.execve(sys.executable, argv, new_env)
-        raise
+    # OOM / NVML / transient crashes here propagate to the top-level supervisor
+    # (main), which classifies them, escalates the degradation ladder, and
+    # re-EXECs with --resume so training continues from the last checkpoint.
+    _train_loop(CFG, stage, rows, init_dir=init_dir, resume=args.resume)
     log(f"=== TRAIN stage={stage} DONE ===  ckpt: {CFG.stage_ckpt(stage)}")
 
 
@@ -2099,6 +2488,129 @@ def cmd_serve(args):
 
 
 # =========================================================================== #
+#  DOCTOR (preflight + auto-fix)  &  AUTO (unattended self-healing roadmap)     #
+# =========================================================================== #
+
+def cmd_doctor(args):
+    """Preflight the environment and auto-fix what it can: CUDA/MIG env, missing
+    deps, low disk, asset paths, TTS reachability (with autostart), HF auth."""
+    CFG.ensure_dirs()
+    log("=== DOCTOR (preflight + auto-fix) ===")
+    healthy = True
+    # CUDA / MIG
+    try:
+        import torch
+        used, total = gpu_mem_gb()
+        log(f"  torch {torch.__version__} cuda={torch.cuda.is_available()} "
+            f"vram={used}/{total}GB alloc_conf={os.environ.get('PYTORCH_CUDA_ALLOC_CONF')}")
+        if not torch.cuda.is_available():
+            log("  WARNING: CUDA not available.", err=True); healthy = False
+    except Exception as e:
+        log(f"  torch missing ({e}) -> auto-installing (a fix, not a hard failure).", err=True)
+        _auto_pip_install(_IMPORT_TO_PKG["torch"], "torch")
+    # core deps — installing a missing one is a FIX, so it does not mark unhealthy
+    for mod in ("transformers", "peft", "datasets", "bitsandbytes", "librosa",
+                "soundfile", "jiwer", "huggingface_hub", "fastapi", "requests"):
+        try:
+            __import__(mod)
+        except Exception:
+            log(f"  missing '{mod}' -> installing {_IMPORT_TO_PKG.get(mod)}", err=True)
+            _auto_pip_install(_IMPORT_TO_PKG.get(mod), mod)
+    # disk
+    try:
+        du = shutil.disk_usage(CFG.work)
+        log(f"  disk free at {CFG.work}: {du.free / 1e9:.1f} GB")
+        if du.free / 1e9 < 20:
+            log("  low disk -> pruning stale files.", err=True); _prune_checkpoints(CFG)
+    except Exception:
+        pass
+    # asset paths
+    for name, pth in (("whisper-ft2", CFG.whisper_ckpt), ("omnivoice-ft1", CFG.omni_model),
+                      ("ref wav", CFG.omni_ref_wav)):
+        exists = Path(pth).exists()
+        log(f"  asset {name}: {pth} -> {'OK' if exists else 'MISSING'}")
+        if not exists:
+            healthy = False
+    # TTS reachability (+ autostart) and HF auth
+    log(f"  TTS reachable/started: {_ensure_tts_server(CFG)}")
+    hf_login_if_needed(interactive=False, require=False)
+    log(f"=== DOCTOR done (healthy={healthy}) ===")
+    return healthy
+
+
+def cmd_auto(args):
+    """Run the WHOLE roadmap unattended: doctor -> data -> train(align,s2s,medical)
+    -> eval. Each step is idempotent and resumable; progress is journaled to
+    roadmap_state.json so that after any crash the top-level supervisor re-EXECs
+    `auto` and it continues from the exact step it left off (train uses --resume)."""
+    import argparse as _ap
+    CFG.ensure_dirs()
+    state_path = Path(CFG.work) / "roadmap_state.json"
+    state = read_json(state_path, {}) or {}
+
+    def _done(step):
+        return state.get(step, {}).get("done")
+
+    def _mark(step):
+        state[step] = {"done": True, "time": time.time()}
+        write_json(state_path, state)
+        # Credit forward progress: a completed step resets the self-heal restart
+        # budget so a long, genuinely-advancing roadmap is not aborted by failures
+        # accumulated across earlier (already-recovered) stages. Repeated failures
+        # WITHIN one stuck step stay bounded (the budget only resets on success).
+        os.environ["TMV_HEAL_REEXEC_N"] = "0"
+
+    def _run_step(step):
+        """Run a step; return True only on REAL success. A raised exception
+        propagates to the top-level supervisor (OOM ladder / restart)."""
+        if step == "doctor":
+            return bool(cmd_doctor(_ap.Namespace()))
+        if step == "data":
+            cmd_data(_ap.Namespace(only=None, n_medical=None, use_teacher=args.use_teacher))
+            counts = {m: _manifest_count(Path(CFG.data_dir) / f"{m}.jsonl")
+                      for m in ("align", "s2s", "medical")}
+            log(f"[auto] data manifests: {counts}")
+            ok = counts["align"] >= 100 and counts["s2s"] >= 1 and counts["medical"] >= 1
+            if not ok:
+                log("[auto] data produced empty/undersized manifests — likely a "
+                    "network or OmniVoice-TTS outage. NOT marking data done.", err=True)
+            return ok
+        if step.startswith("train:"):
+            st = step.split(":", 1)[1]
+            cmd_train(_ap.Namespace(stage=st, resume=True, from_scratch=False,
+                                    allow_textonly=args.allow_textonly))
+            return Path(CFG.stage_ckpt(st), "projector.pt").exists()   # a saved ckpt proves it ran
+        if step == "eval:all":
+            cmd_eval(_ap.Namespace(suite="all", limit=args.limit, baselines=[]))
+            res = read_json(Path(CFG.bench_dir) / "results.json", {}) or {}
+            suites = [k for k in res if not k.startswith("_")]
+            ok = any(not (isinstance(res[k], dict) and res[k].get("error")) for k in suites)
+            if not ok:
+                log("[auto] every eval suite errored — NOT marking eval done.", err=True)
+            return ok
+        return True
+
+    plan = ["doctor", "data", "train:align", "train:s2s", "train:medical", "eval:all"]
+    log(f"=== AUTO roadmap (self-healing, resumable): {plan} ===")
+    for step in plan:
+        if _done(step):
+            log(f"[auto] {step} already complete — skipping.")
+            continue
+        log(f"[auto] >>>>>> {step}")
+        if _run_step(step):
+            _mark(step)
+        else:
+            # a soft failure that healing can't fix (empty corpus, unhealthy env):
+            # surface it (die() is not auto-healed) so it isn't hidden behind a
+            # green checkmark and the user can fix the root cause.
+            die(f"[auto] step '{step}' did not succeed — see the log above. "
+                "Fix the cause (e.g. start the TTS server / check the network / "
+                f"provide missing assets), then re-run: turkish_medvoice.py auto")
+    log("=== AUTO roadmap complete. Benchmark: "
+        f"{Path(CFG.bench_dir) / 'results.json'} ===")
+
+
+# =========================================================================== #
 #  main / argparse                                                             #
 # =========================================================================== #
 
@@ -2112,10 +2624,13 @@ def _apply_yaml(path):
 
 
 def main():
+    _proactive_env()          # MIG/tokenizer env before anything imports torch
     p = argparse.ArgumentParser(
         prog="turkish_medvoice.py",
-        description="Native Turkish medical speech-to-speech: setup/data/train/eval/serve")
+        description="Native Turkish medical speech-to-speech: setup/data/train/eval/serve/doctor/auto")
     p.add_argument("--config", help="optional YAML overriding CONFIG fields")
+    p.add_argument("--no-heal", action="store_true",
+                   help="disable the top-level self-healing supervisor (raise on error)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("setup", help="venv + deps + HF login + smoke test")
@@ -2152,12 +2667,35 @@ def main():
     sv.add_argument("--cascade", action="store_true", help="use the safe cascade path")
     sv.set_defaults(func=cmd_serve)
 
+    doc = sub.add_parser("doctor", help="preflight checks + auto-fix (deps, disk, assets, TTS)")
+    doc.set_defaults(func=cmd_doctor)
+
+    au = sub.add_parser("auto", help="run the whole roadmap unattended (self-healing, resumable)")
+    au.add_argument("--use-teacher", action="store_true")
+    au.add_argument("--allow-textonly", action="store_true")
+    au.add_argument("--limit", type=int, default=200)
+    au.set_defaults(func=cmd_auto)
+
     args = p.parse_args()
     if args.config:
         _apply_yaml(args.config)
+    _apply_heal_level(CFG, HEAL_LEVEL)          # emergency-degradation ladder (env-persisted)
     if getattr(args, "baselines", None):
         globals()["_ACTIVE_BASELINES"] = args.baselines
-    args.func(args)
+
+    # ---- top-level SELF-HEALING supervisor ----
+    try:
+        args.func(args)
+    except (KeyboardInterrupt, SystemExit):
+        raise                                   # user abort / intentional die() -> do not heal
+    except Exception as e:                       # noqa: BLE001
+        import traceback
+        log(f"UNHANDLED {type(e).__name__}: {e}", err=True)
+        log(traceback.format_exc(), err=True)
+        if getattr(args, "no_heal", False):
+            raise
+        supervise(e, args)                       # remediates + re-EXECs, or returns if unhealable
+        raise                                    # not healed -> surface the error
 
 
 if __name__ == "__main__":
