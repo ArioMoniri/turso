@@ -761,36 +761,39 @@ def cmd_setup(args):
             _pip(py, ["-U", "pip", "setuptools", "wheel"])
         except Exception as e:
             log(f"  pip/setuptools/wheel upgrade failed ({e}); continuing.", err=True)
-        # 2c) PyTorch — skip the 889 MB download if it is already installed
-        if _has_module(py, "torch") and _has_module(py, "torchaudio"):
-            log("PyTorch already installed — skipping.")
-        else:
-            log("Installing PyTorch (cu128) ...")
-            _pip(py, ["torch==2.8.0", "torchaudio==2.8.0", "--index-url", TORCH_INDEX])
+        # 2c) PyTorch pinned to the driver-matched build (idempotent no-op if right)
+        _ensure_correct_torch(py)
         # 2d) core + eval packages — FAULT-TOLERANT: if the batch fails, retry each
         #     package individually so one bad package can't abort the whole install.
+        #     A pip CONSTRAINTS file keeps torch pinned so no dep can upgrade it to
+        #     a cu13x build that won't run on a CUDA-12.x driver.
+        cons = _write_torch_constraints()
         log("Installing core + eval packages ...")
         try:
-            _pip(py, list(PIP_PACKAGES))
+            _pip(py, list(PIP_PACKAGES), constraints=cons)
         except Exception:
             log("  batch install failed -> installing package-by-package.", err=True)
             for pkg in PIP_PACKAGES:
                 try:
-                    _pip(py, [pkg])
+                    _pip(py, [pkg], constraints=cons)
                 except Exception as e:
                     log(f"  CORE '{pkg}' failed: {e}", err=True)
         # 2e) optional packages (all non-fatal)
         log("Installing optional packages (failures are non-fatal) ...")
         for pkg in PIP_OPTIONAL:
             try:
-                _pip(py, [pkg])
+                _pip(py, [pkg], constraints=cons)
             except Exception as e:
                 log(f"  optional '{pkg}' failed to install: {e}", err=True)
-        # flash-attn built separately (needs the installed torch present)
+        # 2f) re-enforce torch in case a dependency still swapped it out
+        _ensure_correct_torch(py)
+        # flash-attn is an OPTIONAL speed-up: it needs the CUDA toolkit (nvcc) to
+        # build, which containers often lack. Failure is fine — the model falls
+        # back to attn_implementation='sdpa' automatically.
         try:
-            _pip(py, ["flash-attn>=2.7.0", "--no-build-isolation"])
+            _pip(py, ["flash-attn>=2.7.0", "--no-build-isolation"], constraints=cons)
         except Exception as e:
-            log(f"  flash-attn build failed ({e}); will use attn_implementation='sdpa'.", err=True)
+            log(f"  flash-attn not built ({str(e)[:80]}...) -> using 'sdpa' (fine).", err=True)
 
     # 3) HF auth check (only if requested / interactive)
     if py == sys.executable:
@@ -810,11 +813,62 @@ def _run(cmd):
     subprocess.check_call(cmd)
 
 
-def _pip(py, pkgs):
+def _pip(py, pkgs, constraints=None):
+    extra = ["-c", constraints] if constraints and Path(constraints).exists() else []
     if shutil.which("uv"):
-        _run(["uv", "pip", "install", "--python", py] + pkgs)
+        _run(["uv", "pip", "install", "--python", py] + extra + pkgs)
     else:
-        _run([py, "-m", "pip", "install"] + pkgs)
+        _run([py, "-m", "pip", "install"] + extra + pkgs)
+
+
+# pinned so no dependency can upgrade torch to a CUDA-13 build that won't run on
+# a CUDA-12.x driver. TORCH_PIN is the driver-matched version for this server.
+TORCH_PIN = _env("TMV_TORCH", "2.8.0")
+TORCH_CU = _env("TMV_TORCH_CU", "12")     # required torch.version.cuda major ("12")
+
+
+def _write_torch_constraints():
+    try:
+        CFG.ensure_dirs()
+        p = Path(CFG.work) / "pip-constraints.txt"
+        p.write_text(f"torch=={TORCH_PIN}\ntorchaudio=={TORCH_PIN}\n")
+        return str(p)
+    except Exception:
+        return None
+
+
+def _torch_info(py):
+    """Return (version, cuda_major) of the torch installed in `py`, or ('','')."""
+    try:
+        out = subprocess.check_output(
+            [py, "-c", "import torch,json;print(json.dumps([torch.__version__, "
+                       "(torch.version.cuda or '')]))"],
+            stderr=subprocess.DEVNULL).decode()
+        import json as _j
+        ver, cu = _j.loads(out)
+        return ver, (cu.split(".")[0] if cu else "")
+    except Exception:
+        return "", ""
+
+
+def _ensure_correct_torch(py):
+    """Install / force the driver-matched torch. Idempotent: a no-op if the right
+    version+CUDA is already present, else (re)installs from the cu128 index. This
+    is what prevents the '2.11.0+cu130 on a CUDA-12.8 driver' breakage."""
+    ver, cu_major = _torch_info(py)
+    if ver.startswith(TORCH_PIN) and cu_major == TORCH_CU:
+        log(f"torch OK: {ver} (cuda {cu_major}.x) — matches the driver.")
+        return
+    if ver:
+        log(f"[heal] torch is {ver} (cuda {cu_major}.x) — reinstalling the "
+            f"driver-matched {TORCH_PIN}+cu128 build.", err=True)
+    else:
+        log(f"Installing PyTorch {TORCH_PIN} (cu128) ...")
+    try:
+        _pip(py, ["--force-reinstall", f"torch=={TORCH_PIN}", f"torchaudio=={TORCH_PIN}",
+                  "--index-url", TORCH_INDEX])
+    except Exception as e:
+        log(f"[heal] torch (re)install failed: {e}", err=True)
 
 
 def _has_module(py, mod):
