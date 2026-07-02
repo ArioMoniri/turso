@@ -851,11 +851,14 @@ def _build_align_manifest(cfg):
                         txt = str(ex[_alt]).strip(); break
             if not txt:
                 continue
-            seen += 1
-            if seen <= already:             # already written on a previous run
-                continue
+            # Dump BEFORE the resume gate so `seen` counts only successfully-dumped
+            # candidates, staying in lockstep with `written` (= manifest rows).
+            # A dump that fails must NOT advance `seen`, else resume duplicates rows.
             wav_path = _dump_audio(ex.get(acol), audio_root, written)
             if wav_path is None:
+                continue
+            seen += 1
+            if seen <= already:             # already written on a previous run
                 continue
             append_jsonl(man, {"audio": wav_path, "prompt":
                                "Duyduğun Türkçe konuşmayı aynen yaz.", "target": txt,
@@ -1497,6 +1500,7 @@ def _train_loop(cfg, stage, rows, init_dir=None, resume=False):
     for epoch in range(start_epoch, epochs):
         random.Random(cfg.seed + epoch).shuffle(rows)
         opt.zero_grad(set_to_none=True)
+        micro_count = 0                   # reset per epoch (partial window flushed below)
         pending = False
         for bi in range(0, len(rows), micro):
             batch_rows = rows[bi:bi + micro]
