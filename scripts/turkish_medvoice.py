@@ -174,10 +174,13 @@ class Config:
     # ---- data --------------------------------------------------------------
     # (id, hf_config, split, audio_col, text_col, kind)   kind in {asr, instruct}
     asr_datasets: list = field(default_factory=lambda: [
-        ("ysdede/commonvoice_17_tr_fixed", None, "train", "audio", "sentence", "asr"),
+        # column names verified on the 2026 Hub: both use 'transcription'
+        ("ysdede/commonvoice_17_tr_fixed", None, "train", "audio", "transcription", "asr"),
         ("ysdede/khanacademy-turkish",     None, "train", "audio", "transcription", "asr"),
     ])
-    # heavy/robustness ASR set (parquet viewer is broken -> snapshot_download)
+    # OPTIONAL heavy ASR set (218h). NOT auto-loaded (its parquet viewer is broken;
+    # needs huggingface_hub.snapshot_download + custom parsing). To use it, download
+    # manually and add a tuple to `asr_datasets` pointing at the local files.
     issai_repo: str = "issai/Turkish_Speech_Corpus"
     # Turkish instruction / dialogue text (has some medical)
     instruct_dataset: str = "turkish-nlp-suite/InstrucTurca"
@@ -664,13 +667,28 @@ class TTSBackend:
         return wav, sr
 
     def _http(self, text):
+        # Body matches the user's OmniVoice server contract (README):
+        #   POST /v1/audio/speech  {"input": ..., "language": "tr"}  -> WAV 24kHz.
+        # The clone reference voice (OMNI_REF) is configured server-side, so no
+        # voice field is sent here. `voice` is added only if TMV sets it.
         import io
         import requests
         import soundfile as sf
-        r = requests.post(self.cfg.omni_server_url,
-                          json={"input": text, "language": self.cfg.omni_lang},
-                          timeout=120)
+        payload = {"input": text, "language": self.cfg.omni_lang}
+        voice = os.environ.get("TMV_OMNI_VOICE")
+        if voice:
+            payload["voice"] = voice
+        r = requests.post(self.cfg.omni_server_url, json=payload, timeout=120)
         r.raise_for_status()
+        ctype = r.headers.get("content-type", "")
+        if "json" in ctype:      # some servers return {"audio": <base64>} or a URL
+            import base64
+            j = r.json()
+            b = j.get("audio") or j.get("data")
+            if isinstance(b, str):
+                raw = base64.b64decode(b)
+                return sf.read(io.BytesIO(raw), dtype="float32")
+            raise RuntimeError(f"TTS server returned JSON without audio: {list(j)[:5]}")
         wav, sr = sf.read(io.BytesIO(r.content), dtype="float32")
         return wav, sr
 
@@ -805,14 +823,16 @@ def _build_align_manifest(cfg):
     """Stage-A alignment data: (audio, transcript) -> the projector learns to map
     Whisper features into the LLM embedding space (ASR objective)."""
     man = Path(cfg.data_dir) / "align.jsonl"
-    if man.exists() and _manifest_count(man) >= cfg.n_align * 0.9:
-        log(f"align manifest already has {_manifest_count(man)} rows — skip.")
+    target = cfg.n_align
+    if man.exists() and _manifest_count(man) >= target:
+        log(f"align manifest already has {_manifest_count(man)} rows — done.")
         return
     log(f"Building alignment manifest -> {man}")
     audio_root = Path(cfg.data_dir) / "align_audio"
     audio_root.mkdir(parents=True, exist_ok=True)
-    written = _manifest_count(man)
-    target = cfg.n_align
+    already = _manifest_count(man)          # resume cursor: skip candidates already written
+    written = already
+    seen = 0
     for repo, conf, split, acol, tcol, _ in cfg.asr_datasets:
         if written >= target:
             break
@@ -826,6 +846,13 @@ def _build_align_manifest(cfg):
                 break
             txt = str(ex.get(tcol) or "").strip()
             if not txt:
+                for _alt in ("transcription", "sentence", "text"):   # defensive
+                    if ex.get(_alt):
+                        txt = str(ex[_alt]).strip(); break
+            if not txt:
+                continue
+            seen += 1
+            if seen <= already:             # already written on a previous run
                 continue
             wav_path = _dump_audio(ex.get(acol), audio_root, written)
             if wav_path is None:
@@ -843,18 +870,20 @@ def _build_s2s_manifest(cfg):
     """Stage-B general S2S: (instruction_speech, response_text). We synthesize the
     user's spoken instruction with OmniVoice from Turkish instruction text."""
     man = Path(cfg.data_dir) / "s2s.jsonl"
-    if man.exists() and _manifest_count(man) >= cfg.n_general_s2s * 0.9:
-        log(f"s2s manifest already has {_manifest_count(man)} rows — skip.")
+    target = cfg.n_general_s2s
+    if man.exists() and _manifest_count(man) >= target:
+        log(f"s2s manifest already has {_manifest_count(man)} rows — done.")
         return
     tts = TTSBackend()
     if not tts.available():
         log("  TTS unavailable -> writing TEXT-only s2s pairs (speech synth deferred). "
-            "Start your OmniVoice server and re-run `data --only s2s`.", err=True)
+            "Start your OmniVoice server and re-run `data --only s2s` before training.", err=True)
     log(f"Building general S2S manifest -> {man}")
     audio_root = Path(cfg.synth_dir) / "s2s_audio"
     audio_root.mkdir(parents=True, exist_ok=True)
-    written = _manifest_count(man)
-    target = cfg.n_general_s2s
+    already = _manifest_count(man)
+    written = already
+    seen = 0
     try:
         ds = _hf_load(cfg.instruct_dataset, split="train", streaming=True)
     except Exception as e:
@@ -865,6 +894,9 @@ def _build_s2s_manifest(cfg):
             break
         instr, resp = _extract_instruct(ex)
         if not instr or not resp:
+            continue
+        seen += 1
+        if seen <= already:
             continue
         row = {"prompt": "", "target": resp, "kind": "s2s", "instruction_text": instr}
         if tts.available():
@@ -886,14 +918,19 @@ def _build_medical_triples(cfg, gaz, n, use_teacher=False):
     speech, plus gazetteer-seeded code-switched examples. Optionally augment with
     a teacher LLM (sequence-level KD)."""
     man = Path(cfg.data_dir) / "medical.jsonl"
-    if man.exists() and _manifest_count(man) >= n * 0.9:
-        log(f"medical manifest already has {_manifest_count(man)} rows — skip.")
+    if man.exists() and _manifest_count(man) >= n:
+        log(f"medical manifest already has {_manifest_count(man)} rows — done.")
         return
     tts = TTSBackend()
+    if not tts.available():
+        log("  TTS unavailable -> writing TEXT-only medical pairs (speech synth deferred). "
+            "Start your OmniVoice server and re-run `data --only medical` before training.", err=True)
     log(f"Building medical triples -> {man} (target {n}, teacher={use_teacher})")
     audio_root = Path(cfg.synth_dir) / "medical_audio"
     audio_root.mkdir(parents=True, exist_ok=True)
-    written = _manifest_count(man)
+    already = _manifest_count(man)
+    written = already
+    seen = 0
 
     # (a) real gold Q&A -> best targets, avoids re-transcription error loops
     try:
@@ -906,6 +943,9 @@ def _build_medical_triples(cfg, gaz, n, use_teacher=False):
             break
         q, a = _extract_medqa(ex)
         if not q or not a:
+            continue
+        seen += 1
+        if seen <= already:
             continue
         row = {"prompt": "", "target": a, "kind": "medical", "instruction_text": q}
         if tts.available():
@@ -967,33 +1007,42 @@ def _teacher_augment_medical(cfg, gaz, man, tts, audio_root, start, target):
 
 
 def _load_text_generator(cfg):
-    """Return callable(prompt)->text. Prefer vLLM (fast) with the AWQ teacher;
-    fall back to a transformers text LLM; fall back to None."""
-    # vLLM path (teacher may be Qwen3-Omni AWQ — text stream only)
-    try:
-        from vllm import LLM, SamplingParams
-        llm = LLM(model=cfg.text_teacher_fallback, dtype="bfloat16",
-                  gpu_memory_utilization=0.85, max_model_len=4096, trust_remote_code=True)
-        sp = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=512)
+    """Return callable(prompt)->text. Tries the CONFIGURED teacher first
+    (cfg.teacher_llm, e.g. Qwen3-Omni-30B AWQ — text stream only), via vLLM, then
+    the lighter text fallback, then transformers; None if nothing loads. Whichever
+    is used is logged so the run is honest about the actual teacher."""
+    for tag, model_id in (("teacher", cfg.teacher_llm),
+                          ("text-fallback", cfg.text_teacher_fallback)):
+        try:
+            from vllm import LLM, SamplingParams
+            log(f"  loading {tag} teacher via vLLM: {model_id}")
+            llm = LLM(model=model_id, gpu_memory_utilization=0.85,
+                      max_model_len=4096, trust_remote_code=True)
+            sp = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=512)
 
-        def _gen(prompt, _llm=llm, _sp=sp):
-            out = _llm.generate([_chat_wrap(prompt)], _sp)
-            return out[0].outputs[0].text.strip()
-        return _gen
-    except Exception as e:
-        log(f"  vLLM teacher unavailable ({e}); trying transformers.", err=True)
+            def _gen(prompt, _llm=llm, _sp=sp):
+                out = _llm.generate([_chat_wrap(prompt)], _sp)
+                return out[0].outputs[0].text.strip()
+            log(f"  ACTIVE teacher = {model_id} (vLLM)")
+            return _gen
+        except Exception as e:
+            log(f"  vLLM load of {model_id} failed ({e}).", err=True)
+    # transformers fallback (text model only)
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(cfg.text_teacher_fallback)
+        mid = cfg.text_teacher_fallback
+        log(f"  loading text-fallback teacher via transformers: {mid}")
+        tok = AutoTokenizer.from_pretrained(mid)
         mdl = AutoModelForCausalLM.from_pretrained(
-            cfg.text_teacher_fallback, torch_dtype=torch.bfloat16, device_map="auto")
+            mid, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
 
         def _gen(prompt, _t=tok, _m=mdl):
             msgs = [{"role": "user", "content": prompt}]
             ids = _t.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt").to(_m.device)
             out = _m.generate(ids, max_new_tokens=512, do_sample=True, temperature=0.7, top_p=0.9)
             return _t.decode(out[0][ids.shape[1]:], skip_special_tokens=True).strip()
+        log(f"  ACTIVE teacher = {mid} (transformers)")
         return _gen
     except Exception as e:
         log(f"  transformers teacher unavailable ({e}).", err=True)
@@ -1007,12 +1056,15 @@ def _chat_wrap(prompt):
 # ---- dataset field extractors (robust to schema differences) -------------- #
 
 def _extract_instruct(ex):
-    for a, b in [("instruction", "output"), ("prompt", "response"),
-                 ("input", "output"), ("question", "answer"), ("text", "target")]:
-        if ex.get(a) and ex.get(b):
-            return str(ex[a]).strip(), str(ex[b]).strip()
+    # case-insensitive view so schemas like InstrucTurca's 'Input'/'Output' match
+    low = {str(k).lower(): v for k, v in ex.items()}
+    for a, b in [("input", "output"), ("instruction", "output"),
+                 ("prompt", "response"), ("question", "answer"),
+                 ("text", "target")]:
+        if low.get(a) and low.get(b):
+            return str(low[a]).strip(), str(low[b]).strip()
     # conversation format
-    conv = ex.get("conversations") or ex.get("messages")
+    conv = low.get("conversations") or low.get("messages")
     if isinstance(conv, list) and len(conv) >= 2:
         return str(conv[0].get("value") or conv[0].get("content") or "").strip(), \
                str(conv[1].get("value") or conv[1].get("content") or "").strip()
@@ -1020,10 +1072,13 @@ def _extract_instruct(ex):
 
 
 def _extract_medqa(ex):
-    for a, b in [("question", "answer"), ("input", "output"),
+    # kayrab/patient-doctor-qa-tr-167732 columns: question_content / question_answer
+    low = {str(k).lower(): v for k, v in ex.items()}
+    for a, b in [("question_content", "question_answer"),
+                 ("question", "answer"), ("input", "output"),
                  ("soru", "cevap"), ("patient", "doctor"), ("prompt", "response")]:
-        if ex.get(a) and ex.get(b):
-            return str(ex[a]).strip(), str(ex[b]).strip()
+        if low.get(a) and low.get(b):
+            return str(low[a]).strip(), str(low[b]).strip()
     return _extract_instruct(ex)
 
 
@@ -1193,8 +1248,15 @@ def _load_lora_weights(peft_llm, lora_dir):
         return
     if sd is not None:
         try:
-            set_peft_model_state_dict(peft_llm, sd)
-            log(f"  Loaded LoRA weights from {lora_dir}")
+            res = set_peft_model_state_dict(peft_llm, sd)
+            # verify weights actually landed (guards against silent adapter-name drift)
+            unexpected = list(getattr(res, "unexpected_keys", []) or [])
+            missing = list(getattr(res, "missing_keys", []) or [])
+            if unexpected:
+                log(f"  WARNING: {len(unexpected)} LoRA keys did not match the model "
+                    f"(adapter naming drift?) — resume may be partial.", err=True)
+            log(f"  Loaded {len(sd)} LoRA tensors from {lora_dir} "
+                f"(missing={len(missing)}, unexpected={len(unexpected)}).")
         except Exception as e:
             log(f"  set_peft_model_state_dict failed ({e}).", err=True)
 
@@ -1241,15 +1303,24 @@ class NativeSpeechLLM:
             parts.append(soft); labels += [-100] * soft.shape[0]
         mid_e = emb(mid_ids).squeeze(0)
         parts.append(mid_e);  labels += [-100] * mid_e.shape[0]
+        # Everything so far (system+user prompt + SPEECH soft-tokens + assistant
+        # header) is fixed and MUST be preserved. If we overflow, we trim the
+        # TARGET, never the speech (dropping speech would train the model to
+        # answer without listening).
+        fixed_len = sum(p.shape[0] for p in parts)
         if target_text is not None:
             tgt_ids = self.tok(target_text + self.tok.eos_token, add_special_tokens=False,
                                return_tensors="pt").input_ids.to(self.device)
+            budget = self.cfg.max_seq_len - fixed_len
+            if tgt_ids.shape[1] > max(1, budget):
+                tgt_ids = tgt_ids[:, :max(1, budget)].clone()
+                tgt_ids[0, -1] = self.tok.eos_token_id          # keep an EOS to learn stopping
             tgt_e = emb(tgt_ids).squeeze(0)
             parts.append(tgt_e); labels += tgt_ids.squeeze(0).tolist()
         seq = torch.cat(parts, 0)                                # [L, d_llm]
         lab = torch.tensor(labels, device=self.device)
-        if seq.shape[0] > self.cfg.max_seq_len:                  # truncate from left of the prompt
-            over = seq.shape[0] - self.cfg.max_seq_len
+        if seq.shape[0] > self.cfg.max_seq_len:                  # only if audio alone is huge
+            over = seq.shape[0] - self.cfg.max_seq_len           # trim front of prompt text
             seq, lab = seq[over:], lab[over:]
         return seq, lab
 
@@ -1269,6 +1340,11 @@ class NativeSpeechLLM:
         for i, (s, l) in enumerate(zip(seqs, labs)):
             n = s.shape[0]
             inp[i, :n] = s; att[i, :n] = 1; lab[i, :n] = l
+        # With gradient checkpointing + inputs_embeds, the checkpointed graph
+        # needs an input that requires grad. For text-only rows (no projector
+        # output in the graph) force it on the leaf.
+        if self.llm.training and not inp.requires_grad:
+            inp.requires_grad_(True)
         out = self.llm(inputs_embeds=inp, attention_mask=att, labels=lab)
         return out.loss
 
@@ -1314,35 +1390,65 @@ def cmd_train(args):
     man = Path(CFG.data_dir) / STAGE_MANIFEST[stage]
     rows = read_jsonl(man)
     rows = [r for r in rows if r.get("target")]
+    if stage == "distill":
+        # distill == SEQUENCE-LEVEL knowledge distillation: train only on rows whose
+        # targets were produced by the teacher LLM (`data --use-teacher`). Without
+        # teacher rows there is nothing to distill, so fail loudly instead of
+        # silently re-running the medical SFT.
+        rows = [r for r in rows if r.get("source") == "teacher"]
+        if not rows:
+            die("distill stage found no teacher-generated rows. Run "
+                "`data --only medical --use-teacher` first (sequence-level KD).")
     if not rows:
         die(f"No training rows in {man}. Run `data` first (or `data --only {stage}`).")
-    # for align we need audio; for s2s/medical, audio optional (text-only degrades to text SFT)
-    log(f"{len(rows)} rows loaded from {man}.")
+    log(f"{len(rows)} rows loaded from {man} (stage={stage}).")
+
+    # Speech-requirement guard: these stages must train a SPEECH-in model. If the
+    # manifest has little/no audio (e.g. OmniVoice was down during `data`), we
+    # would silently train a TEXT-only model and the benchmark would measure the
+    # wrong thing. Refuse unless explicitly overridden.
+    audio_rows = sum(1 for r in rows if r.get("audio"))
+    frac = audio_rows / max(1, len(rows))
+    if stage in ("align", "s2s", "medical") and frac < 0.5:
+        log(f"WARNING: only {audio_rows}/{len(rows)} ({frac:.0%}) rows carry speech audio.",
+            err=True)
+        if not args.allow_textonly:
+            die("Refusing to train a speech-less model. Start your OmniVoice TTS server "
+                f"(README) and rebuild data (`data --only {stage}`), or pass "
+                "--allow-textonly to intentionally train text-only.")
 
     # init from the previous stage's adapters (curriculum), unless --from-scratch
     init_dir = None
-    if not args.from_scratch and stage in STAGE_ORDER:
-        idx = STAGE_ORDER.index(stage)
-        if idx > 0:
-            prev = CFG.stage_ckpt(STAGE_ORDER[idx - 1])
-            if Path(prev, "projector.pt").exists():
-                init_dir = prev
-                log(f"Initializing from previous stage adapters: {prev}")
+    if not args.from_scratch:
+        prev = None
+        if stage in STAGE_ORDER and STAGE_ORDER.index(stage) > 0:
+            prev = CFG.stage_ckpt(STAGE_ORDER[STAGE_ORDER.index(stage) - 1])
+        elif stage == "distill":
+            prev = CFG.stage_ckpt("medical")     # distill builds on the medical model
+        if prev and Path(prev, "projector.pt").exists():
+            init_dir = prev
+            log(f"Initializing from previous stage adapters: {prev}")
 
     try:
         _train_loop(CFG, stage, rows, init_dir=init_dir, resume=args.resume)
     except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            log("CUDA OOM — applying VRAM fallback (shorter seq + bigger grad-accum) "
-                "and retrying from last checkpoint.", err=True)
-            import torch
-            torch.cuda.empty_cache()
-            CFG.max_seq_len = max(1024, CFG.max_seq_len // 2)
-            CFG.grad_accum = CFG.grad_accum * 2
-            CFG.micro_batch = 1
-            _train_loop(CFG, stage, rows, init_dir=init_dir, resume=True)
-        else:
-            raise
+        if "out of memory" in str(e).lower() and os.environ.get("TMV_OOM_RETRY", "0") == "0":
+            # A leaked CUDA context / dead allocation cannot be reliably freed inside
+            # the same process, so re-EXEC with a smaller footprint + --resume. This
+            # fully resets CUDA. TMV_OOM_RETRY guards against an infinite loop.
+            log("CUDA OOM — re-launching with halved seq-len, doubled grad-accum, "
+                "--resume (this fully resets CUDA).", err=True)
+            new_env = dict(os.environ)
+            new_env["TMV_OOM_RETRY"] = "1"
+            new_env["TMV_MAXSEQ"] = str(max(1024, CFG.max_seq_len // 2))
+            new_env["TMV_GA"] = str(CFG.grad_accum * 2)
+            new_env["TMV_MBS"] = "1"
+            argv = [sys.executable] + sys.argv
+            if "--resume" not in argv:
+                argv.append("--resume")
+            sys.stdout.flush()
+            os.execve(sys.executable, argv, new_env)
+        raise
     log(f"=== TRAIN stage={stage} DONE ===  ckpt: {CFG.stage_ckpt(stage)}")
 
 
@@ -1355,21 +1461,28 @@ def _train_loop(cfg, stage, rows, init_dir=None, resume=False):
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
     state_path = Path(ckpt_dir) / "trainer_state.json"
 
-    model, tok, feat = build_model(cfg, for_training=True,
-                                   adapter_dir=(init_dir if not resume else ckpt_dir))
+    # Choose where adapters come from: a real checkpoint for this stage takes
+    # priority on --resume; otherwise fall back to the curriculum init_dir. This
+    # matters for the OOM re-exec, which passes --resume even before any
+    # checkpoint has been written — without this it would lose the previous stage.
+    have_ckpt = Path(ckpt_dir, "projector.pt").exists()
+    adapter_dir = ckpt_dir if (resume and have_ckpt) else init_dir
+    model, tok, feat = build_model(cfg, for_training=True, adapter_dir=adapter_dir)
     params = model.trainable_parameters()
     lr = cfg.stage_lr.get(stage, 1e-4)
     opt = PagedAdamW8bit(params, lr=lr, weight_decay=0.0)
 
     start_step, start_epoch = 0, 0
-    if resume and state_path.exists():
+    if resume and have_ckpt and state_path.exists():
         st = read_json(state_path, {})
         start_step = st.get("global_step", 0)
         start_epoch = st.get("epoch", 0)
         op = Path(ckpt_dir) / "optimizer.pt"
         if op.exists():
             try:
-                opt.load_state_dict(torch.load(op, map_location=model.device))
+                # weights_only=False: bnb 8-bit optimizer state holds non-tensor objects
+                opt.load_state_dict(torch.load(op, map_location=model.device,
+                                               weights_only=False))
                 log(f"Resumed optimizer + step {start_step}.")
             except Exception as e:
                 log(f"optimizer resume failed ({e}); continuing with fresh optimizer.", err=True)
@@ -1378,11 +1491,13 @@ def _train_loop(cfg, stage, rows, init_dir=None, resume=False):
     micro = cfg.micro_batch
     ga = cfg.grad_accum
     global_step = start_step
+    micro_count = 0                       # counts ACTUAL backward() calls (not loop index)
     t0 = time.time()
 
     for epoch in range(start_epoch, epochs):
         random.Random(cfg.seed + epoch).shuffle(rows)
         opt.zero_grad(set_to_none=True)
+        pending = False
         for bi in range(0, len(rows), micro):
             batch_rows = rows[bi:bi + micro]
             batch = [(_load_wav(r.get("audio")),
@@ -1393,10 +1508,13 @@ def _train_loop(cfg, stage, rows, init_dir=None, resume=False):
                 continue
             loss = model.forward_batch(batch) / ga
             loss.backward()
-            if ((bi // micro) + 1) % ga == 0:
+            pending = True
+            micro_count += 1
+            if micro_count % ga == 0:                       # true accumulation boundary
                 torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
                 opt.step()
                 opt.zero_grad(set_to_none=True)
+                pending = False
                 global_step += 1
                 if global_step % cfg.log_steps == 0:
                     used, total = gpu_mem_gb()
@@ -1406,6 +1524,11 @@ def _train_loop(cfg, stage, rows, init_dir=None, resume=False):
                         f"vram={used}/{total}GB {sps:.2f} step/s")
                 if global_step % cfg.save_steps == 0:
                     _save_ckpt(model, opt, ckpt_dir, global_step, epoch)
+        if pending:                                         # flush the final partial window
+            torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+            global_step += 1
         _save_ckpt(model, opt, ckpt_dir, global_step, epoch + 1)
     _save_ckpt(model, opt, ckpt_dir, global_step, epochs)
     log(f"Training finished: {global_step} optimizer steps in {time.time() - t0:.0f}s.")
@@ -1443,21 +1566,33 @@ def cmd_eval(args):
     results = read_json(Path(CFG.bench_dir) / "results.json", {}) or {}
 
     if suite in ("asr", "all"):
-        results["asr"] = eval_asr(CFG, limit=args.limit)
+        results["asr"] = eval_asr(CFG, limit=args.limit); _free_gpu()
     if suite in ("tts", "all"):
-        results["tts"] = eval_tts(CFG, limit=args.limit)
+        results["tts"] = eval_tts(CFG, limit=args.limit); _free_gpu()
     if suite in ("s2s", "all"):
-        results["s2s"] = eval_s2s(CFG, limit=args.limit)
+        results["s2s"] = eval_s2s(CFG, limit=args.limit); _free_gpu()
     if suite in ("medical", "all"):
-        results["medical"] = eval_medical(CFG, limit=args.limit)
+        results["medical"] = eval_medical(CFG, limit=args.limit); _free_gpu()
     if suite in ("latency", "all"):
-        results["latency"] = eval_latency(CFG)
+        results["latency"] = eval_latency(CFG); _free_gpu()
 
     results["_meta"] = {"time": time.time(), "student": CFG.student_llm,
                         "ckpt": CFG.stage_ckpt("medical")}
     write_json(Path(CFG.bench_dir) / "results.json", results)
     _print_report(results)
     log(f"=== EVAL DONE ===  full JSON: {Path(CFG.bench_dir) / 'results.json'}")
+
+
+def _free_gpu():
+    """Release GPU memory between heavy eval models so they don't co-reside."""
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _wer_cer(refs, hyps):
@@ -1488,6 +1623,7 @@ def eval_asr(cfg, limit=200):
     if args_has_baseline("mms"):
         models["mms-1b-all"] = "facebook/mms-1b-all"
     for name, mid in models.items():
+        asr = None
         try:
             asr = ASRBackend(mid, cfg)
             hyps = [asr.transcribe(w, 16000, "tr") for w in wavs]
@@ -1496,6 +1632,9 @@ def eval_asr(cfg, limit=200):
         except Exception as e:
             out[name] = {"error": str(e)}
             log(f"    {name}: FAILED {e}", err=True)
+        finally:
+            del asr           # free each Whisper pipeline before loading the next
+            _free_gpu()
     return out
 
 
@@ -1544,9 +1683,11 @@ def eval_s2s(cfg, limit=100):
             if _match(ans, it["answer"]):
                 correct += 1
         out["native (ours)"] = {"acc": round(correct / len(items), 4), "n": len(items)}
+        del model, tok, feat        # free the native 7B before loading the cascade 7B
     except Exception as e:
         out["native (ours)"] = {"error": str(e)}
         log(f"    native S2S failed: {e}", err=True)
+    _free_gpu()
     # cascade baseline (whisper-ft2 ASR -> student text -> match)
     try:
         out["cascade (whisper-ft2 + student)"] = _eval_cascade_qa(cfg, items)
@@ -1630,10 +1771,11 @@ def _load_fleurs_tr(cfg, limit):
 
 
 def _tts_eval_sentences(cfg, limit):
-    # mix general FLEURS refs + medical sentences (drug names) for pronunciation stress
+    """UNIQUE sentences (no replication): FLEURS-tr real refs + curated medical
+    pronunciation-stress sentences. Returns at most `limit` distinct sentences."""
     out = []
     try:
-        refs, _ = _load_fleurs_tr(cfg, limit // 2)
+        refs, _ = _load_fleurs_tr(cfg, max(1, limit - 10))
         out += refs
     except Exception:
         pass
@@ -1641,13 +1783,52 @@ def _tts_eval_sentences(cfg, limit):
            "Kan basıncı yüksekti, amlodipin dozu artırıldı.",
            "Siprofloksasin tedavisine rağmen ateş devam ediyor.",
            "Metformin ve insülin birlikte kullanılıyor.",
-           "Migren atakları için profilaktik tedavi başlandı."]
-    out += (med * ((limit // 2) // len(med) + 1))[:limit // 2]
-    return out[:limit]
+           "Migren atakları için profilaktik tedavi başlandı.",
+           "Warfarin dozu INR değerine göre ayarlandı.",
+           "Klopidogrel ve asetilsalisilik asit birlikte verildi.",
+           "Levotiroksin sabah aç karnına alınmalıdır.",
+           "Furosemid ile ödem kontrol altına alındı.",
+           "Atorvastatin ile kolesterol düzeyi düştü."]
+    out += med
+    uniq = list(dict.fromkeys(out))          # de-duplicate, preserve order
+    if len(uniq) < limit:
+        log(f"    [note] only {len(uniq)} UNIQUE TTS eval sentences available "
+            f"(requested {limit}); reporting the true count.", err=True)
+    return uniq[:limit]
+
+
+def _load_medturkquad(cfg, limit):
+    """Best-effort real Turkish MEDICAL questions from MedTurkQuAD (EVAL-ONLY,
+    CC-BY-NC-ND). Returns list of (question, short_answer). Empty on failure."""
+    out = []
+    try:
+        ds = _hf_load(cfg.medturkquad_repo, split="validation", streaming=True)
+    except Exception:
+        try:
+            ds = _hf_load(cfg.medturkquad_repo, split="train", streaming=True)
+        except Exception as e:
+            log(f"    MedTurkQuAD unavailable ({e}); using curated medical probes only.", err=True)
+            return out
+    for ex in ds:
+        low = {str(k).lower(): v for k, v in ex.items()}
+        q = str(low.get("question") or "").strip()
+        ans = low.get("answers") or low.get("answer") or ""
+        if isinstance(ans, dict):
+            texts = ans.get("text") or []
+            ans = texts[0] if texts else ""
+        elif isinstance(ans, list):
+            ans = ans[0] if ans else ""
+        a = str(ans).strip()
+        if q:
+            out.append((q, a))
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _spoken_qa_set(cfg, limit):
-    """Render short Turkish medical questions with known short answers to speech."""
+    """Turkish spoken-QA eval items (UNIQUE, no replication). Curated short-answer
+    factual set + real MedTurkQuAD questions, each rendered to speech."""
     tts = TTSBackend(cfg)
     if not tts.available():
         return []
@@ -1655,28 +1836,51 @@ def _spoken_qa_set(cfg, limit):
           ("Kalp kaç odacıktan oluşur?", "dört"),
           ("İnsülin hangi organda üretilir?", "pankreas"),
           ("Tansiyon ölçen alete ne denir?", "tansiyon aleti"),
-          ("Kırmızı kan hücrelerini üreten doku nedir?", "kemik iliği")]
+          ("Kırmızı kan hücrelerini üreten doku nedir?", "kemik iliği"),
+          ("Kanın pıhtılaşmasını sağlayan hücreler nelerdir?", "trombosit"),
+          ("Böbrek taşı hangi organda oluşur?", "böbrek"),
+          ("Vücudun ana solunum kası hangisidir?", "diyafram")]
+    pairs = list(qa) + _load_medturkquad(cfg, max(0, limit - len(qa)))
+    pairs = pairs[:limit]
     items = []
-    for i, (q, a) in enumerate((qa * (limit // len(qa) + 1))[:limit]):
+    for q, a in pairs:
         wav, sr = tts.synth(q)
         items.append({"wav": _to16k(wav, sr), "answer": a, "prompt": ""})
+    log(f"    spoken-QA: {len(items)} UNIQUE items "
+        f"({'curated+MedTurkQuAD' if len(items) > len(qa) else 'curated only'}).")
     return items
 
 
 def _medical_eval_set(cfg, limit):
+    """Medical-term probes (UNIQUE). Curated code-switch probes + real MedTurkQuAD
+    questions whose expected terms are mined from the gazetteer."""
     tts = TTSBackend(cfg)
     if not tts.available():
         return []
+    gaz = load_gazetteer(cfg)
     probes = [("Amoksisilin ne için kullanılır?", ["amoksisilin"]),
               ("Ciprofloxacin yan etkileri nelerdir?", ["siprofloksasin"]),
-              ("Diyabet tedavisinde metformin nasıl etki eder?", ["metformin", "diyabet"]),
+              ("Diyabet tedavisinde metformin nasıl etki eder?", ["metformin"]),
               ("Hipertansiyon nedir?", ["hipertansiyon"]),
-              ("Astım krizinde ne yapılmalı?", ["astım"])]
-    items = []
-    for q, terms in (probes * (limit // len(probes) + 1))[:limit]:
-        wav, sr = tts.synth(q)
-        items.append({"wav": _to16k(wav, sr), "expected_terms": terms, "prompt": ""})
-    return items
+              ("Astım krizinde ne yapılmalı?", ["astım"]),
+              ("Warfarin kullanan hastada nelere dikkat edilmeli?", ["varfarin"]),
+              ("Atorvastatin kolesterolü nasıl düşürür?", ["atorvastatin"])]
+    items = [{"q": q, "terms": t} for q, t in probes]
+    # augment with real MedTurkQuAD questions; expected terms = gazetteer hits
+    for q, _a in _load_medturkquad(cfg, max(0, limit - len(items))):
+        ql = tr_lower(q)
+        hits = [row["term"] for key, row in gaz.items() if key in ql]
+        if hits:
+            items.append({"q": q, "terms": hits[:3]})
+        if len(items) >= limit:
+            break
+    items = items[:limit]
+    out = []
+    for it in items:
+        wav, sr = tts.synth(it["q"])
+        out.append({"wav": _to16k(wav, sr), "expected_terms": it["terms"], "prompt": ""})
+    log(f"    medical-term eval: {len(out)} UNIQUE probes.")
+    return out
 
 
 def _eval_cascade_qa(cfg, items):
@@ -1694,7 +1898,10 @@ def _eval_cascade_qa(cfg, items):
         gen = mdl.generate(ids, max_new_tokens=64, do_sample=False)
         ans = tok.decode(gen[0][ids.shape[1]:], skip_special_tokens=True)
         correct += int(_match(ans, it["answer"]))
-    return {"acc": round(correct / len(items), 4), "n": len(items)}
+    res = {"acc": round(correct / len(items), 4), "n": len(items)}
+    del asr, mdl, tok
+    _free_gpu()
+    return res
 
 
 def _match(hyp, ref):
@@ -1703,11 +1910,20 @@ def _match(hyp, ref):
 
 def _mos_score(wavs, srs):
     try:
+        import tempfile
+        import soundfile as sf
         import utmosv2
         model = utmosv2.create_model(pretrained=True)
         scores = []
         for w, sr in zip(wavs, srs):
-            scores.append(float(model.predict(w, sr)))
+            # UTMOSv2.predict is keyword-only: predict(data=..., sr=...) or input_path=...
+            try:
+                val = model.predict(data=w, sr=sr)
+            except TypeError:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                    sf.write(tf.name, w, sr)
+                    val = model.predict(input_path=tf.name)
+            scores.append(float(val["predicted_mos"] if isinstance(val, dict) else val))
         return round(sum(scores) / len(scores), 3)
     except Exception as e:
         log(f"    UTMOSv2 unavailable ({e}); trying torchmetrics DNSMOS.", err=True)
@@ -1865,8 +2081,10 @@ def cmd_serve(args):
         gaz = load_gazetteer(CFG)
         speech, srr = tts.synth(apply_pronunciation(text, gaz)) if tts.available() else (np.zeros(1), 24000)
         buf = io.BytesIO(); sf.write(buf, speech, srr, format="WAV")
+        # HTTP headers are latin-1 only; Turkish (ş/ı/ğ/İ...) must be URL-encoded.
+        from urllib.parse import quote
         return Response(content=buf.getvalue(), media_type="audio/wav",
-                        headers={"X-Response-Text": text[:512]})
+                        headers={"X-Response-Text": quote(text[:2000])})
 
     @app.get("/health")
     def health():
@@ -1914,6 +2132,8 @@ def main():
     t.add_argument("--resume", action="store_true")
     t.add_argument("--from-scratch", action="store_true",
                    help="do NOT init from the previous stage's adapters")
+    t.add_argument("--allow-textonly", action="store_true",
+                   help="train even if the manifest has little/no speech audio")
     t.set_defaults(func=cmd_train)
 
     e = sub.add_parser("eval", help="run the Turkish voice benchmark")
