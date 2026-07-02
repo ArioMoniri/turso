@@ -1327,8 +1327,10 @@ def cmd_data(args):
 def _hf_load(repo, config=None, split=None, streaming=True, audio_col=None):
     def _do():
         from datasets import load_dataset
+        # NOTE: no trust_remote_code — datasets>=4 removed it (all datasets we use
+        # are standard Parquet, no loading script), and passing it now just warns.
         ds = load_dataset(repo, config, split=split, streaming=streaming,
-                          cache_dir=CFG.hf_cache, trust_remote_code=True)
+                          cache_dir=CFG.hf_cache)
         if audio_col:
             # Decode audio OURSELVES (soundfile/librosa) rather than via datasets'
             # torchcodec backend: datasets>=4 dropped the soundfile decoder and
