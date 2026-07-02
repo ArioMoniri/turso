@@ -706,25 +706,31 @@ def hf_login_if_needed(interactive=True, require=False):
 # =========================================================================== #
 
 PIP_PACKAGES = [
-    # core
-    "torch==2.8.0", "torchaudio==2.8.0",   # installed with the cu128 index below
+    # core (pure-python / prebuilt wheels only — nothing here needs a C compiler)
     "transformers>=4.57.0", "accelerate>=0.34", "peft>=0.14", "datasets>=2.18",
     "bitsandbytes>=0.45", "huggingface_hub>=0.25", "safetensors",
     "librosa==0.10.2", "soundfile", "sentencepiece", "numpy<2.3", "pyyaml",
     # serving
     "fastapi", "uvicorn[standard]", "python-multipart", "requests",
     # eval
-    "jiwer>=3.0.4", "torchmetrics[audio]", "speechbrain", "resemblyzer",
+    "jiwer>=3.0.4", "torchmetrics[audio]", "speechbrain",
     # tts (your OmniVoice)
     "omnivoice",
 ]
 PIP_OPTIONAL = [
+    # resemblyzer pulls in webrtcvad, which COMPILES a C extension (needs
+    # python3-dev). It is only a speaker-sim SANITY check in eval, so it is
+    # optional and its failure is non-fatal.
+    "resemblyzer",
     "trnorm", "whisper-normalizer",                 # Turkish normalization
     "vllm>=0.17", "qwen-omni-utils[decord]",        # teacher / judge inference
     "git+https://github.com/sarulab-speech/UTMOSv2.git",   # UTMOS MOS predictor
     "phonemizer",                                   # medical G2P (needs espeak-ng)
 ]
 TORCH_INDEX = "https://download.pytorch.org/whl/cu128"
+# system packages needed so compiled wheels (webrtcvad, etc.) can build, and for
+# audio I/O + Turkish/medical G2P. Installed best-effort via apt.
+APT_BUILD_DEPS = ["python3-dev", "build-essential", "ffmpeg", "libsndfile1", "espeak-ng"]
 
 
 def cmd_setup(args):
@@ -747,10 +753,33 @@ def cmd_setup(args):
     # 2) install deps into the venv (or current interpreter if --no-venv)
     py = str(venv_py) if venv_py.exists() and not args.no_venv else sys.executable
     if not args.skip_install:
-        log("Installing PyTorch (cu128) ...")
-        _pip(py, ["torch==2.8.0", "torchaudio==2.8.0", "--index-url", TORCH_INDEX])
+        # 2a) system build deps first, so any C-extension wheel (e.g. webrtcvad)
+        #     can compile instead of failing on a missing Python.h.
+        _apt_build_deps()
+        # 2b) modern build frontend (turns legacy setup.py installs into wheels)
+        try:
+            _pip(py, ["-U", "pip", "setuptools", "wheel"])
+        except Exception as e:
+            log(f"  pip/setuptools/wheel upgrade failed ({e}); continuing.", err=True)
+        # 2c) PyTorch — skip the 889 MB download if it is already installed
+        if _has_module(py, "torch") and _has_module(py, "torchaudio"):
+            log("PyTorch already installed — skipping.")
+        else:
+            log("Installing PyTorch (cu128) ...")
+            _pip(py, ["torch==2.8.0", "torchaudio==2.8.0", "--index-url", TORCH_INDEX])
+        # 2d) core + eval packages — FAULT-TOLERANT: if the batch fails, retry each
+        #     package individually so one bad package can't abort the whole install.
         log("Installing core + eval packages ...")
-        _pip(py, [p for p in PIP_PACKAGES if not p.startswith("torch")])
+        try:
+            _pip(py, list(PIP_PACKAGES))
+        except Exception:
+            log("  batch install failed -> installing package-by-package.", err=True)
+            for pkg in PIP_PACKAGES:
+                try:
+                    _pip(py, [pkg])
+                except Exception as e:
+                    log(f"  CORE '{pkg}' failed: {e}", err=True)
+        # 2e) optional packages (all non-fatal)
         log("Installing optional packages (failures are non-fatal) ...")
         for pkg in PIP_OPTIONAL:
             try:
@@ -786,6 +815,36 @@ def _pip(py, pkgs):
         _run(["uv", "pip", "install", "--python", py] + pkgs)
     else:
         _run([py, "-m", "pip", "install"] + pkgs)
+
+
+def _has_module(py, mod):
+    """True if `mod` imports in the target interpreter (avoids re-installing)."""
+    try:
+        subprocess.check_call([py, "-c", f"import {mod}"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
+def _apt_build_deps():
+    """Best-effort install of the OS build/audio deps so C-extension wheels can
+    compile (webrtcvad -> Python.h) and audio/G2P work. Skipped silently if apt
+    is absent (non-Debian) or we lack privileges."""
+    if not shutil.which("apt-get"):
+        log("apt-get not found — skipping system build deps (install python3-dev "
+            "+ build-essential manually if a wheel fails to compile).", err=True)
+        return
+    sudo = [] if os.geteuid() == 0 else (["sudo"] if shutil.which("sudo") else [])
+    try:
+        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+        log("Installing system build deps (python3-dev, build-essential, ffmpeg, ...) ...")
+        subprocess.run(sudo + ["apt-get", "update", "-qq"], env=env, check=False)
+        subprocess.run(sudo + ["apt-get", "install", "-y", "-qq"] + APT_BUILD_DEPS,
+                       env=env, check=False)
+    except Exception as e:
+        log(f"  system dep install failed ({e}); continuing (a compiled wheel may "
+            "fail — install python3-dev manually).", err=True)
 
 
 def _smoke_test():
