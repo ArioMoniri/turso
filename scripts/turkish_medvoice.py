@@ -1644,8 +1644,10 @@ def _ensure_tts_server(cfg, timeout=90):
         omni_py = os.environ.get("TMV_OMNI_VENV_PY", "/root/venv-omni/bin/python")
         app_dir = os.environ.get("TMV_OMNI_APP_DIR", str(Path(cfg.root) / "app"))
         if not (Path(omni_py).exists() and Path(app_dir).exists()):
-            log(f"[heal] cannot autostart TTS (missing {omni_py} or {app_dir}); "
-                "start it manually per README.", err=True)
+            log(f"[heal] cannot autostart TTS: {omni_py} or {app_dir} not found. Either "
+                "start your OmniVoice :8133 server manually, OR point autostart at it with "
+                "TMV_OMNI_VENV_PY=<venv-python> and TMV_OMNI_APP_DIR=<dir-with-omnivoice_server.py>.",
+                err=True)
             return False
         # Guard against spawning DUPLICATE GPU servers across re-execs / repeated
         # heals: if we already started one and it's still alive, just wait for it.
