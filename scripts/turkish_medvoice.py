@@ -15,10 +15,15 @@ WHY "native" (and not a cascade)?
 A cascade (STT -> text-LLM -> TTS) waits for the *whole* transcript, then the
 *whole* response, then the *whole* synthesis before the first audio plays. This
 model (a) skips the Whisper ASR *decoder* entirely — the frozen Whisper *encoder*
-features feed the LLM directly — and (b) STREAMS: the LLM emits Turkish response
-text incrementally and the OmniVoice tail starts speaking the first chunk while
-the LLM is still generating. First-audio latency drops from "sum of three full
+features feed the LLM directly — and (b) can STREAM: the LLM emits Turkish response
+text incrementally and the OmniVoice tail starts speaking the first chunk while the
+LLM is still generating, so first-audio latency drops from "sum of three full
 stages" to "encoder pass + first text chunk + one OmniVoice chunk (RTF ~0.025)".
+That streaming path is exposed at POST /v1/audio/voice-chat/stream (chunked 24kHz
+PCM); the plain POST /v1/audio/voice-chat returns the full turn as one WAV for
+clients that cannot consume a stream. In BOTH, the clinical safety intent-gate runs
+on the whole utterance FIRST and fails CLOSED (refuses rather than answers if the
+gate transcript is unavailable).
 
 ARCHITECTURE  (all generative parts are Apache/MIT so the product is shippable)
 --------------------------------------------------------------------------------
@@ -48,7 +53,8 @@ SUBCOMMANDS
           (instruction_speech, response_text, response_speech) triples  [cached]
   train   --stage {align,s2s,medical,distill} [--resume]   QLoRA, checkpoint/resume
   eval    --suite {asr,tts,s2s,medical,all} [--baselines ...]   the full benchmark
-  serve   streaming native S2S endpoint  (--cascade for the safe fallback path)
+  serve   native S2S API: /voice-chat (full-turn WAV) + /voice-chat/stream
+          (chunked low-latency PCM); safety gate fails CLOSED  (--cascade fallback)
   doctor  preflight + AUTO-FIX (CUDA/MIG env, missing deps, low disk, asset paths,
           TTS reachability with autostart, HF auth)
   auto    run the WHOLE roadmap unattended (doctor->data->train*->eval), resumable
@@ -1178,6 +1184,22 @@ ANATOMY_SYMPTOM = [
     "radyoterapi", "ameliyat", "rehabilitasyon", "aşılama", "enjeksiyon",
 ]
 
+# English + Latin medical/anatomy terms (code-switched in Turkish clinical speech,
+# and Latin nomenclature). The model is medical-AWARE but not medicine-limited and
+# must handle Turkish + English + Latin.
+EN_LATIN_MEDICAL = [
+    "diagnosis", "prognosis", "syndrome", "chronic", "acute", "benign", "malignant",
+    "hypertension", "diabetes", "infection", "inflammation", "antibiotic", "analgesic",
+    "cardiac", "pulmonary", "hepatic", "renal", "gastric", "cerebral", "vascular",
+    "coronary", "myocardial", "respiratory", "neurological", "oncology", "radiology",
+    "biopsy", "endoscopy", "ultrasound", "tomography", "dosage", "injection", "tablet",
+    "vena cava", "arteria", "musculus", "nervus", "cortex", "medulla", "pulmo", "hepar",
+    "ren", "cor", "cerebrum", "cerebellum", "abdomen", "thorax", "pelvis", "femur",
+    "tibia", "humerus", "vertebra", "carcinoma", "adenoma", "necrosis", "sepsis",
+    "embolus", "thrombus", "edema", "stenosis", "ischemia", "fibrosis", "atrophy",
+    "in vitro", "in vivo", "per os", "status quo", "ad libitum",
+]
+
 SEED_ICD10_TR = [
     ("E11", "Tip 2 diabetes mellitus"), ("I10", "Esansiyel hipertansiyon"),
     ("J45", "Astım"), ("J18", "Pnömoni"), ("K29", "Gastrit ve duodenit"),
@@ -1226,6 +1248,10 @@ def build_gazetteer(cfg):
         add(u, "tr", "dose")
     for a in ANATOMY_SYMPTOM:
         add(a, "tr", "anatomy")
+    # seed: English + Latin medical/anatomy terms — medical-aware but not TR-only,
+    # so code-switched clinical speech and Latin nomenclature tokenize atomically.
+    for t in EN_LATIN_MEDICAL:
+        add(t, "en_la", "medical_en")
 
     # OPTIONAL: real TITCK Turkish drug list (best-effort; scrape the rotating XLSX
     # link, parse the active-ingredient column). Falls back silently to the seeds.
@@ -2129,7 +2155,8 @@ TR_SUFFIXES = ["ları", "leri", "larında", "lerinde", "larından", "lerinden",
 
 
 CLASS_WEIGHT = {"drug": 3.0, "lasa": 3.0, "dose": 2.5, "diagnosis": 2.0,
-                "diagnosis_token": 1.5, "anatomy": 1.5, "general": 1.0, "suffix": 1.0}
+                "medical_en": 2.0, "diagnosis_token": 1.5, "anatomy": 1.5,
+                "general": 1.0, "suffix": 1.0}
 
 
 def _ingest_titck_drugs(cfg, add):
@@ -2164,20 +2191,27 @@ def _ingest_titck_drugs(cfg, add):
 
 
 def _mine_vocab_candidates(cfg, tok, k):
-    """Mine ~k MEDICAL-FIRST Turkish tokens. Budget ~55% medical / 30% morphology /
-    15% general. Medical seeds (drugs both spellings, LASA sound-alike names, dose
-    units, diagnoses, anatomy) are HARD-INCLUDED (frequency-independent, pieces>=2 so
-    a 2-piece drug still qualifies) — a compression-only miner would drop rare-but-
-    deadly drug names. General words are mined from a large Turkish medical corpus."""
+    """Mine ~k tokens that are MEDICAL-AWARE but NOT medicine-limited, spanning
+    Turkish + English + Latin. Budget ~45% medical / 20% morphology / 35% general.
+    Medical seeds (TR/EN/Latin drug names both spellings, LASA sound-alike names,
+    dose units, diagnoses, anatomy, EN/Latin nomenclature) are HARD-INCLUDED
+    (frequency-independent, pieces>=2 so a 2-piece term still qualifies) — a
+    compression-only miner would drop rare-but-deadly drug names. General words are
+    mined from BOTH a Turkish MEDICAL corpus AND a large GENERAL Turkish corpus so
+    the tokenizer stays fluent on everyday (non-clinical) Turkish too."""
     import re
     from collections import Counter
-    log(f"[vocab] mining ~{k} MEDICAL-first Turkish candidate tokens ...")
+    log(f"[vocab] mining ~{k} medical-aware (TR+EN+Latin) candidate tokens ...")
+
+    # letters cover Turkish + ASCII (English/Latin) + spaces for multiword terms
+    TERM_RE = re.compile(r"[a-zçğıöşü ]{3,40}")
+    WORD_RE = re.compile(r"[a-zçğıöşü]{6,}")
 
     def pieces(s):
         return len(tok(s, add_special_tokens=False).input_ids)
 
     gaz = load_gazetteer(cfg)
-    # (a) medical seeds by class, hard-included; drugs/LASA kept at pieces>=2
+    # (a) medical seeds by class, hard-included; drugs/LASA/EN-Latin kept at pieces>=2
     seen, med = set(), []
     for row in gaz.values():
         typ = row.get("type", "general")
@@ -2185,9 +2219,9 @@ def _mine_vocab_candidates(cfg, tok, k):
             if not form:
                 continue
             s = str(form).lower().strip()
-            if s in seen or not re.fullmatch(r"[a-zçğıöşü ]{3,40}", s):
+            if s in seen or not TERM_RE.fullmatch(s):
                 continue
-            thr = 2 if typ in ("drug", "lasa", "dose") else 3
+            thr = 2 if typ in ("drug", "lasa", "dose", "medical_en") else 3
             if pieces(s) >= thr:
                 med.append((s, CLASS_WEIGHT.get(typ, 1.0), pieces(s)))
                 seen.add(s)
@@ -2198,30 +2232,39 @@ def _mine_vocab_candidates(cfg, tok, k):
     morph = [s for s in TR_SUFFIXES if s not in seen and pieces(s) >= 2]
     seen.update(morph)
 
-    # (c) general medical words mined from a large Turkish medical corpus (best-effort)
+    # (c) general words mined from a Turkish MEDICAL corpus AND a GENERAL Turkish
+    # corpus (best-effort, accumulate across every reachable source — do NOT stop at
+    # the first). col=None -> medqa extractor; col="*" -> all string fields.
     freq = Counter()
-    for repo, split, col in (("iskenderulgen/turkish_medical_corpus", "train", "sentence"),
-                             (cfg.medqa_dataset, "train", None)):
+    sources = (("iskenderulgen/turkish_medical_corpus", "train", "sentence"),
+               (cfg.medqa_dataset, "train", None),
+               (cfg.instruct_dataset, "train", "*"))
+    for repo, split, col in sources:
         try:
             ds = _hf_load(repo, split=split, streaming=True)
             n = 0
             for ex in ds:
-                txts = [str(ex.get(col, ""))] if col else list(_extract_medqa(ex))
+                if col == "*":
+                    txts = [str(v) for v in ex.values() if isinstance(v, str)]
+                elif col:
+                    txts = [str(ex.get(col, ""))]
+                else:
+                    txts = list(_extract_medqa(ex))
                 for txt in txts:
-                    for w in re.findall(r"[a-zçğıöşü]{6,}", tr_lower(txt or "")):
+                    for w in WORD_RE.findall(tr_lower(txt or "")):
                         freq[w] += 1
                 n += 1
                 if n >= 20000:
                     break
-            break
+            log(f"  mined {n} rows from {repo}.")
         except Exception as e:
             log(f"  corpus {repo} mining skipped ({e}).", err=True)
     general = sorted((w for w in freq if w not in seen and pieces(w) >= 3),
                      key=lambda w: freq[w] * (pieces(w) - 1), reverse=True)
 
-    # (d) assemble to budget: medical first (~55%), then morphology (~30%), general
-    n_med = min(len(med_tokens), int(k * 0.55))
-    n_morph = min(len(morph), int(k * 0.30))
+    # (d) assemble to budget: medical (~45%), morphology (~20%), general TR/EN (~35%)
+    n_med = min(len(med_tokens), int(k * 0.45))
+    n_morph = min(len(morph), int(k * 0.20))
     out = list(dict.fromkeys(med_tokens[:n_med]))
     for w in morph[:n_morph]:
         if w not in out:
@@ -2233,8 +2276,10 @@ def _mine_vocab_candidates(cfg, tok, k):
             out.append(w)
     out = out[:k]
     med_set = set(med_tokens)
+    n_general = len(out) - sum(1 for w in out if w in med_set) - \
+        sum(1 for w in out if w in set(morph))
     log(f"[vocab] mined {len(out)} tokens ({sum(1 for w in out if w in med_set)} medical, "
-        f"{n_morph} morphology, rest general).")
+        f"{sum(1 for w in out if w in set(morph))} morphology, {n_general} general TR/EN/Latin).")
     return out
 
 
@@ -3937,12 +3982,51 @@ def cmd_serve(args):
     import numpy as np
     import soundfile as sf
     from fastapi import FastAPI, UploadFile, File
-    from fastapi.responses import Response
+    from fastapi.responses import Response, StreamingResponse
     import uvicorn
 
     app = FastAPI(title="turkish-medvoice")
     tts = TTSBackend(CFG)
     state = {}
+    FAIL_CLOSED = ("Sesinizi tam olarak çözümleyemedim. Durum acilse lütfen 112'yi arayın; "
+                   "aksi halde lütfen bir hekime danışın.")
+
+    def _serve_gate(wav16):
+        """Transcribe for the safety intent-gate. Returns (question, gate_active).
+        FAILS CLOSED: gate_active=False tells the caller to refuse, never to answer
+        a possibly-high-risk utterance whose danger the answer may not echo."""
+        try:
+            asr = state.get("asr") or state.setdefault("gate_asr", ASRBackend(CFG.whisper_ckpt, CFG))
+            return asr.transcribe(wav16, 16000, "tr"), True
+        except Exception as e:
+            log(f"[safety] intent-gate ASR failed ({e}); FAILING CLOSED.", err=True)
+            return None, False
+
+    def _answer_text(wav16, question):
+        """Generate the (non-streamed) answer text for a verified-safe request."""
+        if args.cascade:
+            import torch
+            tok, llm = state["tok"], state["llm"]
+            ids = tok.apply_chat_template(
+                [{"role": "system", "content": MED_SYSTEM_PROMPT},
+                 {"role": "user", "content": question or ""}],
+                add_generation_prompt=True, return_tensors="pt").to(llm.device)
+            gen = llm.generate(ids, max_new_tokens=256, do_sample=False)
+            return tok.decode(gen[0][ids.shape[1]:], skip_special_tokens=True)
+        model, tok = state["model"], state["tok"]
+        gen = model.generate_ids(wav16, "", max_new_tokens=256)
+        return tok.decode(gen[0], skip_special_tokens=True)
+
+    def _pcm(text, gaz):
+        """Synthesize one text chunk to 24kHz mono int16 PCM bytes (streaming frame)."""
+        if not tts.available() or not (text or "").strip():
+            return b""
+        w, s = tts.synth(apply_pronunciation(text, gaz))
+        x = np.asarray(w, dtype="float32").reshape(-1)
+        if s != 24000:
+            import librosa
+            x = librosa.resample(x, orig_sr=s, target_sr=24000)
+        return (np.clip(x, -1, 1) * 32767.0).astype("<i2").tobytes()
 
     def _lazy():
         if "ready" in state:
@@ -3962,41 +4046,74 @@ def cmd_serve(args):
 
     @app.post("/v1/audio/voice-chat")
     async def voice_chat(file: UploadFile = File(...)):
+        """Full-turn endpoint: returns one WAV for the whole answer (for clients that
+        can't consume a stream). For low first-audio latency use /voice-chat/stream."""
         _lazy()
         raw = await file.read()
         wav, sr = sf.read(io.BytesIO(raw), dtype="float32")
         wav16 = _to16k(wav, sr)
-        question = None
-        if args.cascade:
-            q = state["asr"].transcribe(wav16, 16000, "tr"); question = q
-            import torch
-            tok, llm = state["tok"], state["llm"]
-            # cascade path must carry the SAME safety system prompt as the native path
-            ids = tok.apply_chat_template(
-                [{"role": "system", "content": MED_SYSTEM_PROMPT},
-                 {"role": "user", "content": q}],
-                add_generation_prompt=True, return_tensors="pt").to(llm.device)
-            gen = llm.generate(ids, max_new_tokens=256, do_sample=False)
-            text = tok.decode(gen[0][ids.shape[1]:], skip_special_tokens=True)
+        # SAFETY runs FIRST and FAIL-CLOSED: a refusal or an unusable intent-gate
+        # transcript preempts generation entirely.
+        question, gate_active = _serve_gate(wav16)
+        kind, refusal = safety_flag(question) if question else (None, None)
+        if refusal:
+            text = apply_disclaimer(CFG, refusal)
+        elif not gate_active:
+            text = apply_disclaimer(CFG, FAIL_CLOSED)          # cannot verify intent -> refuse
         else:
-            model, tok = state["model"], state["tok"]
-            # transcribe once for the safety intent-gate (cheap; native path stays native)
-            try:
-                question = state.setdefault("gate_asr", ASRBackend(CFG.whisper_ckpt, CFG)).transcribe(
-                    wav16, 16000, "tr")
-            except Exception:
-                question = None
-            gen = model.generate_ids(wav16, "", max_new_tokens=256)
-            text = tok.decode(gen[0], skip_special_tokens=True)
-        # CLINICAL SAFETY: refuse+refer on high-risk intents; always add the disclaimer
-        text = safe_answer(CFG, question, text)
+            text = safe_answer(CFG, question, _answer_text(wav16, question))
         gaz = load_gazetteer(CFG)
         speech, srr = tts.synth(apply_pronunciation(text, gaz)) if tts.available() else (np.zeros(1), 24000)
-        buf = io.BytesIO(); sf.write(buf, speech, srr, format="WAV")
-        # HTTP headers are latin-1 only; Turkish (ş/ı/ğ/İ...) must be URL-encoded.
+        b = io.BytesIO(); sf.write(b, speech, srr, format="WAV")
         from urllib.parse import quote
-        return Response(content=buf.getvalue(), media_type="audio/wav",
-                        headers={"X-Response-Text": quote(text[:2000])})
+        return Response(content=b.getvalue(), media_type="audio/wav",
+                        headers={"X-Response-Text": quote(text[:2000]),
+                                 "X-Gate-Active": str(gate_active)})
+
+    @app.post("/v1/audio/voice-chat/stream")
+    async def voice_chat_stream(file: UploadFile = File(...)):
+        """Low-latency native V2V: streams 24kHz mono int16 PCM as the LLM generates.
+        The safety intent-gate runs on the WHOLE utterance FIRST so a refusal preempts
+        any audio; then answer text is chunked at sentence/clause boundaries and each
+        chunk is synthesized while the LLM keeps generating (first-audio ~ one chunk,
+        not the whole turn)."""
+        _lazy()
+        raw = await file.read()
+        wav, sr = sf.read(io.BytesIO(raw), dtype="float32")
+        wav16 = _to16k(wav, sr)
+        gaz = load_gazetteer(CFG)
+        question, gate_active = _serve_gate(wav16)
+        kind, refusal = safety_flag(question) if question else (None, None)
+        media = "audio/L16; rate=24000"
+        if refusal or not gate_active:
+            msg = apply_disclaimer(CFG, refusal or FAIL_CLOSED)
+            return StreamingResponse(iter([_pcm(msg, gaz)]), media_type=media)
+        if args.cascade:      # cascade has no token streamer here -> one-shot chunk
+            text = safe_answer(CFG, question, _answer_text(wav16, question))
+            return StreamingResponse(iter([_pcm(text, gaz)]), media_type=media)
+
+        def audio_stream():
+            from transformers import TextIteratorStreamer
+            import threading
+            import re as _re
+            model, tok = state["model"], state["tok"]
+            streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+            th = threading.Thread(target=model.generate_ids,
+                                  kwargs={"wav": wav16, "prompt_text": "",
+                                          "max_new_tokens": 256, "streamer": streamer})
+            th.start()
+            buf = ""
+            for piece in streamer:
+                buf += piece
+                if _re.search(r"[.!?\n]", buf) or len(buf.split()) >= CFG.stream_chunk_tokens:
+                    chunk, buf = buf.strip(), ""
+                    if chunk:
+                        yield _pcm(chunk, gaz)          # per-chunk pronunciation-rewritten TTS
+            if buf.strip():
+                yield _pcm(buf.strip(), gaz)
+            yield _pcm(CFG.med_disclaimer, gaz)         # spoken disclaimer at the end
+            th.join(timeout=60)
+        return StreamingResponse(audio_stream(), media_type=media)
 
     @app.get("/health")
     def health():
