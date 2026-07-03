@@ -1550,8 +1550,12 @@ def _build_align_manifest(cfg):
     log(f"Building alignment manifest -> {man}")
     audio_root = Path(cfg.data_dir) / "align_audio"
     audio_root.mkdir(parents=True, exist_ok=True)
-    already = _manifest_count(man)          # resume cursor: skip candidates already written
-    written = already
+    cursor_file = Path(str(man) + ".cursor")
+    written = _manifest_count(man)
+    # `consumed` = # of text-valid candidates already ATTEMPTED (persisted), so a
+    # RESUME can skip them WITHOUT re-decoding audio (avoids a near-hang re-decoding
+    # every prior clip). Persisted at each successful write -> no duplicate rows.
+    consumed = int((read_json(cursor_file, {"c": 0}) or {}).get("c", 0))
     seen = 0
     for repo, conf, split, acol, tcol, _ in cfg.asr_datasets:
         if written >= target:
@@ -1571,21 +1575,21 @@ def _build_align_manifest(cfg):
                         txt = str(ex[_alt]).strip(); break
             if not txt:
                 continue
-            # Dump BEFORE the resume gate so `seen` counts only successfully-dumped
-            # candidates, staying in lockstep with `written` (= manifest rows).
-            # A dump that fails must NOT advance `seen`, else resume duplicates rows.
-            wav_path = _dump_audio(ex.get(acol), audio_root, written)
-            if wav_path is None:
-                continue
             seen += 1
-            if seen <= already:             # already written on a previous run
+            if seen <= consumed:            # already attempted on a prior run -> NO decode
+                continue
+            wav_path = _dump_audio(ex.get(acol), audio_root, written)
+            consumed += 1                   # this candidate is now attempted (ok or not)
+            if wav_path is None:
                 continue
             append_jsonl(man, {"audio": wav_path, "prompt":
                                "Duyduğun Türkçe konuşmayı aynen yaz.", "target": txt,
                                "kind": "align"})
             written += 1
+            write_json(cursor_file, {"c": consumed})   # keep cursor in sync -> dup-free resume
             if written % 2000 == 0:
                 log(f"  align: {written} rows")
+    write_json(cursor_file, {"c": consumed})
     log(f"align manifest: {written} rows")
 
 
@@ -1946,7 +1950,11 @@ def build_model(cfg, for_training=True, adapter_dir=None):
                     "gate_proj", "up_proj", "down_proj"]
         _modules_to_save = None
         if cfg.lora_targets_embed:
-            _modules_to_save = ["embed_tokens", "lm_head"]   # full-train these small heads
+            # NOTE: opt-in (TMV_LORA_EMBED=1, off by default). Qwen2.5-7B has
+            # tie_word_embeddings=false, so embed_tokens + lm_head are two separate
+            # ~545M matrices trained FULLY in bf16 — adds ~5-9GB (weights+grads+opt).
+            # Enable only with memory headroom; the OOM ladder can't shrink this.
+            _modules_to_save = ["embed_tokens", "lm_head"]
         lcfg = LoraConfig(r=cfg.lora_r, lora_alpha=cfg.lora_alpha,
                           lora_dropout=cfg.lora_dropout, bias="none",
                           task_type="CAUSAL_LM", target_modules=_targets,
@@ -2227,33 +2235,47 @@ def _train_loop(cfg, stage, rows, init_dir=None, resume=False):
     log(f"stage={stage}: train={len(train_rows)} val={len(val_rows)}")
 
     params = model.trainable_parameters()
+    # weight decay only on >=2-D weights; exclude LayerNorm gains/biases + biases
+    decay = [p for p in params if p.requires_grad and p.ndim >= 2]
+    no_decay = [p for p in params if p.requires_grad and p.ndim < 2]
     lr = cfg.stage_lr.get(stage, 1e-4)
-    opt = PagedAdamW8bit(params, lr=lr, weight_decay=cfg.weight_decay)
+    opt = PagedAdamW8bit([{"params": decay, "weight_decay": cfg.weight_decay},
+                          {"params": no_decay, "weight_decay": 0.0}], lr=lr)
 
     micro, ga = cfg.micro_batch, cfg.grad_accum
     epochs = cfg.stage_epochs.get(stage, 1)
+
+    # Read resume state BEFORE building the scheduler so the horizon (total_steps)
+    # is PINNED to the checkpointed value — an OOM-heal restart may change
+    # grad_accum, which would otherwise change total_steps and corrupt the LR curve.
+    start_step, start_epoch, best_val, no_improve, start_intra = 0, 0, float("inf"), 0, 0
+    saved_total = saved_warmup = None
+    if resume and have_ckpt and state_path.exists():
+        st = read_json(state_path, {})
+        start_step = st.get("global_step", 0); start_epoch = st.get("epoch", 0)
+        best_val = st.get("best_val", float("inf")); no_improve = st.get("no_improve", 0)
+        start_intra = st.get("steps_this_epoch", 0)
+        saved_total, saved_warmup = st.get("total_steps"), st.get("warmup_steps")
+
     steps_per_epoch = max(1, math.ceil(len(train_rows) / (micro * ga)))
-    total_steps = steps_per_epoch * epochs
-    warmup_steps = max(1, int(total_steps * cfg.warmup_ratio))
+    total_steps = int(saved_total) if saved_total else steps_per_epoch * epochs
+    warmup_steps = int(saved_warmup) if saved_warmup else max(1, int(total_steps * cfg.warmup_ratio))
     sched = get_scheduler(cfg.lr_scheduler, optimizer=opt,
                           num_warmup_steps=warmup_steps, num_training_steps=total_steps)
     log(f"stage={stage}: {total_steps} planned opt-steps ({epochs} ep x {steps_per_epoch}), "
         f"warmup={warmup_steps}, sched={cfg.lr_scheduler}, wd={cfg.weight_decay}, "
         f"lora_r={cfg.lora_r}, kd={'seq-level' if stage == 'distill' else 'no'}")
 
-    start_step, start_epoch, best_val, no_improve = 0, 0, float("inf"), 0
     if resume and have_ckpt and state_path.exists():
-        st = read_json(state_path, {})
-        start_step = st.get("global_step", 0); start_epoch = st.get("epoch", 0)
-        best_val = st.get("best_val", float("inf")); no_improve = st.get("no_improve", 0)
-        for name, obj, wo in (("optimizer.pt", opt, False), ("scheduler.pt", sched, False)):
+        for name, obj in (("optimizer.pt", opt), ("scheduler.pt", sched)):
             fp = Path(ckpt_dir) / name
             if fp.exists():
                 try:
-                    obj.load_state_dict(torch.load(fp, map_location=model.device, weights_only=wo))
+                    obj.load_state_dict(torch.load(fp, map_location=model.device, weights_only=False))
                 except Exception as e:
                     log(f"  {name} resume failed ({e}); continuing.", err=True)
-        log(f"Resumed @ step {start_step} (best_val={best_val:.4f}, no_improve={no_improve}).")
+        log(f"Resumed @ step {start_step} (epoch {start_epoch}, intra {start_intra}, "
+            f"best_val={best_val:.4f}).")
 
     def _run_val():
         model.llm.eval()
@@ -2276,17 +2298,27 @@ def _train_loop(cfg, stage, rows, init_dir=None, resume=False):
     t0 = time.time()
     stop = False
 
+    def _ck(step, epoch_, intra):
+        _save_ckpt(model, opt, sched, ckpt_dir, step, epoch_, best_val, no_improve,
+                   steps_this_epoch=intra, total_steps=total_steps, warmup_steps=warmup_steps)
+
     for epoch in range(start_epoch, epochs):
         order = list(range(len(train_rows)))
-        random.Random(cfg.seed + epoch).shuffle(order)
+        random.Random(cfg.seed + epoch).shuffle(order)     # deterministic -> resume lands here
         if cfg.length_bucket:   # sort within megabatches by target length -> less padding
             mb = micro * ga * 32
             order = [j for i in range(0, len(order), mb)
                      for j in sorted(order[i:i + mb],
                                      key=lambda j: len(train_rows[j].get("target", "")))]
+        # step-accurate resume: skip whole grad-accum windows already done THIS epoch
+        steps_this_epoch = start_intra if epoch == start_epoch else 0
+        skip_bi = steps_this_epoch * ga * micro
+        if skip_bi:
+            log(f"  resume: fast-forwarding {steps_this_epoch} opt-steps "
+                f"({skip_bi} rows) into epoch {epoch}.")
         opt.zero_grad(set_to_none=True)
         micro_count, pending, last_loss = 0, False, float("nan")
-        for bi in range(0, len(order), micro):
+        for bi in range(skip_bi, len(order), micro):
             batch = [(_load_wav(train_rows[j].get("audio")),
                       train_rows[j].get("prompt") or train_rows[j].get("instruction_text") or "",
                       train_rows[j]["target"]) for j in order[bi:bi + micro]]
@@ -2306,7 +2338,7 @@ def _train_loop(cfg, stage, rows, init_dir=None, resume=False):
             if micro_count % ga == 0:
                 torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
                 opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
-                pending = False; global_step += 1
+                pending = False; global_step += 1; steps_this_epoch += 1
                 cur_lr = sched.get_last_lr()[0]
                 if global_step % cfg.log_steps == 0:
                     used, total = gpu_mem_gb()
@@ -2316,7 +2348,7 @@ def _train_loop(cfg, stage, rows, init_dir=None, resume=False):
                     append_jsonl(metrics_path, {"step": global_step, "epoch": epoch,
                                                 "loss": last_loss, "lr": cur_lr, "t": time.time()})
                 if global_step % cfg.save_steps == 0:
-                    _save_ckpt(model, opt, sched, ckpt_dir, global_step, epoch, best_val, no_improve)
+                    _ck(global_step, epoch, steps_this_epoch)
                 if cfg.eval_steps > 0 and val_rows and global_step % cfg.eval_steps == 0:
                     vl = _run_val()
                     append_jsonl(metrics_path, {"step": global_step, "val_loss": vl})
@@ -2334,11 +2366,12 @@ def _train_loop(cfg, stage, rows, init_dir=None, resume=False):
                     break
         if pending and not stop:
             torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
-            opt.step(); sched.step(); opt.zero_grad(set_to_none=True); global_step += 1
-        _save_ckpt(model, opt, sched, ckpt_dir, global_step, epoch + 1, best_val, no_improve)
+            opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
+            global_step += 1; steps_this_epoch += 1
+        _ck(global_step, epoch + 1, 0)       # epoch boundary -> intra cursor resets to 0
         if stop:
             break
-    _save_ckpt(model, opt, sched, ckpt_dir, global_step, epochs, best_val, no_improve)
+    _ck(global_step, epochs, 0)
     # promote the best-val checkpoint to the stage checkpoint (so the next stage /
     # eval init from the best, not the last, weights)
     if Path(best_dir, "projector.pt").exists() and best_val < float("inf"):
@@ -2347,7 +2380,8 @@ def _train_loop(cfg, stage, rows, init_dir=None, resume=False):
     log(f"Training finished: {global_step} steps in {time.time() - t0:.0f}s. best_val={best_val:.4f}")
 
 
-def _save_ckpt(model, opt, sched, ckpt_dir, step, epoch, best_val, no_improve):
+def _save_ckpt(model, opt, sched, ckpt_dir, step, epoch, best_val, no_improve,
+               steps_this_epoch=0, total_steps=None, warmup_steps=None):
     import torch
     model.save_adapters(ckpt_dir)
     torch.save(opt.state_dict(), str(Path(ckpt_dir) / "optimizer.pt"))
@@ -2355,10 +2389,15 @@ def _save_ckpt(model, opt, sched, ckpt_dir, step, epoch, best_val, no_improve):
         torch.save(sched.state_dict(), str(Path(ckpt_dir) / "scheduler.pt"))
     except Exception:
         pass
-    write_json(Path(ckpt_dir) / "trainer_state.json",
-               {"global_step": step, "epoch": epoch, "best_val": best_val,
-                "no_improve": no_improve, "time": time.time()})
-    log(f"  checkpoint saved @ step {step} -> {ckpt_dir}")
+    state = {"global_step": step, "epoch": epoch, "best_val": best_val,
+             "no_improve": no_improve, "steps_this_epoch": steps_this_epoch,
+             "time": time.time()}
+    if total_steps is not None:
+        state["total_steps"] = total_steps
+    if warmup_steps is not None:
+        state["warmup_steps"] = warmup_steps
+    write_json(Path(ckpt_dir) / "trainer_state.json", state)
+    log(f"  checkpoint saved @ step {step} (epoch {epoch}, intra {steps_this_epoch}) -> {ckpt_dir}")
 
 
 def _promote_best(best_dir, ckpt_dir):
@@ -2558,7 +2597,9 @@ def eval_asr(cfg, limit=200):
 
 
 def _load_mediaspeech_tr(cfg, limit):
-    ds = _hf_load(cfg.mediaspeech_repo, "tr", "test", streaming=True, audio_col="audio")
+    # ymoslem/MediaSpeech config "tr" only has a "train" split (no "test"); we never
+    # train on it, so using it as a held-out domain-shift eval set is valid.
+    ds = _hf_load(cfg.mediaspeech_repo, "tr", "train", streaming=True, audio_col="audio")
     refs, wavs = [], []
     for ex in ds:
         low = {str(k).lower(): v for k, v in ex.items()}
@@ -2595,33 +2636,37 @@ def eval_tts(cfg, limit=100):
     S = [sr for _, sr in wavs]
     res = {"round_trip": _wer_cer(refs, hyps, ci=True),
            "mos_utmos": _mos_score(W, S),
-           "mos_nisqa": _nisqa_score(W, S),
+           "mos_squim": _squim_mos(cfg, W, S),
            "speaker_sim_ecapa": _speaker_sim(cfg, W, S),
            "prosody": _prosody_stats(W, S),
            "n": len(W)}
     log(f"    round-trip WER={res['round_trip'].get('wer')}  UTMOS={res['mos_utmos']}  "
-        f"NISQA={res['mos_nisqa']}  spk_sim={res['speaker_sim_ecapa']}")
+        f"SQUIM={res['mos_squim']}  spk_sim={res['speaker_sim_ecapa']}")
     return res
 
 
-def _nisqa_score(wavs, srs):
-    """Reference-free naturalness MOS via NISQA if available, else skipped."""
+def _squim_mos(cfg, wavs, srs):
+    """Reference-based naturalness MOS via torchaudio SQUIM_SUBJECTIVE (NORESQA-MOS).
+    It requires a CLEAN NON-MATCHING reference (NOT the signal itself) — we use the
+    clean voice-clone reference clip as the anchor, loaded ONCE."""
     try:
-        from nisqa.NISQA_model import nisqaModel   # optional
-    except Exception:
-        try:
-            import torchaudio
-            bundle = torchaudio.pipelines.SQUIM_SUBJECTIVE  # torchaudio's MOS estimator
-            import torch
-            model = bundle.get_model()
-            vals = []
-            for w, sr in zip(wavs, srs):
-                x = torch.tensor(_to16k(w, sr)).unsqueeze(0)
-                vals.append(float(model(x, x)))     # non-matching-reference MOS
-            return round(sum(vals) / len(vals), 3) if vals else None
-        except Exception as e:
-            return {"error": f"no NISQA/SQUIM ({e})"}
-    return {"note": "nisqa present; run its CLI for full metrics"}
+        import torch
+        import torchaudio
+        model = torchaudio.pipelines.SQUIM_SUBJECTIVE.get_model()
+        ref = _load_wav(cfg.omni_ref_wav)                    # clean 16k mono anchor
+        if ref is None or len(ref) < 1600:
+            return {"error": "no clean non-matching reference for SQUIM"}
+        ref_t = torch.tensor(ref, dtype=torch.float32).unsqueeze(0)
+        vals = []
+        for w, sr in zip(wavs, srs):
+            x = torch.tensor(_to16k(w, sr), dtype=torch.float32).unsqueeze(0)
+            try:
+                vals.append(float(model(x, ref_t)))          # (test, clean-reference)
+            except Exception:
+                pass
+        return round(sum(vals) / len(vals), 3) if vals else None
+    except Exception as e:
+        return {"error": f"SQUIM unavailable ({e})"}
 
 
 def _prosody_stats(wavs, srs):
