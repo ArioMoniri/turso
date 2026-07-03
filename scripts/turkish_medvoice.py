@@ -123,13 +123,19 @@ clinical decision tool. Medical outputs must be reviewed by a professional.
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Serializes OmniVoice-TTS autostart across the parallel synth ThreadPool so two
+# worker threads can never spawn duplicate GPU servers (double-checked in-lock).
+_TTS_AUTOSTART_LOCK = threading.Lock()
 
 # --------------------------------------------------------------------------- #
 #  Only stdlib is imported at module load. Heavy libs (torch, transformers,    #
@@ -179,7 +185,10 @@ class Config:
     # ---- projector / model dims -------------------------------------------
     whisper_dim:   int = 1280
     down_factor:   int = 2          # 50 Hz -> 25 Hz
-    max_audio_sec: float = 30.0     # Whisper 30 s window
+    # Cap the audio actually fed to the encoder. Whisper's window is 30 s, but a
+    # long clip -> up to 1500 frames -> ~750 speech soft-tokens, which dominate the
+    # LLM sequence (and VRAM). Lower this (e.g. 20-25) to bound peak VRAM/RAM.
+    max_audio_sec: float = float(_env("TMV_MAX_AUDIO_SEC", "30.0"))
     max_seq_len:   int = int(_env("TMV_MAXSEQ", "3072"))
 
     # ---- QLoRA / training --------------------------------------------------
@@ -194,6 +203,14 @@ class Config:
     save_steps:    int = int(_env("TMV_SAVE_STEPS", "500"))
     log_steps:     int = int(_env("TMV_LOG_STEPS", "10"))
     max_grad_norm: float = 1.0
+    # ---- proactive VRAM watchdog (avoid OOM instead of only recovering from it) --
+    # At each logged step: if reserved/total exceeds vram_guard_frac -> empty_cache;
+    # if it still exceeds vram_shrink_frac -> shrink max_seq_len by vram_shrink_step
+    # (floored at vram_min_seq) so subsequent examples are trimmed BEFORE they OOM.
+    vram_guard_frac:  float = float(_env("TMV_VRAM_GUARD",  "0.90"))
+    vram_shrink_frac: float = float(_env("TMV_VRAM_SHRINK", "0.94"))
+    vram_shrink_step: int = int(_env("TMV_VRAM_SHRINK_STEP", "256"))
+    vram_min_seq:     int = int(_env("TMV_VRAM_MIN_SEQ", "1024"))
 
     # per-stage LR / epochs (LoRA-tuned, not the paper's full-FT LRs)
     stage_lr:     dict = field(default_factory=lambda: {
@@ -423,6 +440,40 @@ def gpu_mem_gb():
     except Exception:
         pass
     return None, None
+
+
+def _vram_watchdog(cfg):
+    """Proactively relieve device-memory pressure BEFORE an OOM (rather than only
+    recovering from one). Reads DRIVER-level occupancy (counts this process + any
+    co-tenant like an autostarted TTS server on the same MIG slice):
+      * >= vram_guard_frac  -> torch.cuda.empty_cache() (return cached blocks)
+      * still >= vram_shrink_frac -> shrink cfg.max_seq_len by vram_shrink_step
+        (floored at vram_min_seq) so later examples are trimmed before they OOM.
+    Returns True if it acted. Cheap on the common path (one mem_get_info call)."""
+    import torch
+    try:
+        if not torch.cuda.is_available():
+            return False
+        free, total = torch.cuda.mem_get_info()
+        frac = (total - free) / max(1, total)
+    except Exception:
+        return False
+    acted = False
+    if frac >= cfg.vram_guard_frac:
+        try:
+            torch.cuda.empty_cache()
+            free, total = torch.cuda.mem_get_info()
+            frac = (total - free) / max(1, total)
+        except Exception:
+            pass
+        acted = True
+    if frac >= cfg.vram_shrink_frac and cfg.max_seq_len > cfg.vram_min_seq:
+        new = max(cfg.vram_min_seq, cfg.max_seq_len - cfg.vram_shrink_step)
+        log(f"  [vram] {frac:.0%} used >= {cfg.vram_shrink_frac:.0%} ceiling -> shrinking "
+            f"max_seq_len {cfg.max_seq_len} -> {new} to avert OOM.", err=True)
+        cfg.max_seq_len = new
+        acted = True
+    return acted
 
 
 def set_seed(seed):
@@ -773,11 +824,21 @@ def _flush_synth(tts, jobs, workers):
     is the HTTP server (thread-safe, has its own request timeout), run them
     concurrently for a big throughput win on large (hardcore) data builds. Returns
     {out_path: ok_bool}."""
+    # A synth "succeeds" ONLY if a real, non-empty WAV landed on disk (> 44-byte
+    # header). tts.synth() can return without writing (empty/whitespace text) or a
+    # degenerate near-empty file; without this check a bad synth would set the
+    # manifest's audio key and the speech-guard would pass on a speech-less row.
+    def _ok(path):
+        try:
+            return os.path.exists(path) and os.path.getsize(path) > 44
+        except OSError:
+            return False
+
     results = {}
     if workers <= 1 or getattr(tts, "mode", None) != "http":
         for text, path in jobs:
             try:
-                _synth(tts, text, path); results[path] = True
+                _synth(tts, text, path); results[path] = _ok(path)
             except Exception as e:
                 log(f"  synth failed: {e}", err=True); results[path] = False
         return results
@@ -787,7 +848,7 @@ def _flush_synth(tts, jobs, workers):
         text, path = job
         try:
             tts.synth(text, out_path=path)   # HTTP request timeout guards hangs off-thread
-            return path, True
+            return path, _ok(path)
         except Exception as e:
             log(f"  synth failed: {e}", err=True)
             return path, False
@@ -1573,55 +1634,62 @@ def _ensure_tts_server(cfg, timeout=90):
         return True
     if os.environ.get("TMV_AUTOSTART_TTS", "1") != "1":
         return False
-    omni_py = os.environ.get("TMV_OMNI_VENV_PY", "/root/venv-omni/bin/python")
-    app_dir = os.environ.get("TMV_OMNI_APP_DIR", str(Path(cfg.root) / "app"))
-    if not (Path(omni_py).exists() and Path(app_dir).exists()):
-        log(f"[heal] cannot autostart TTS (missing {omni_py} or {app_dir}); "
-            "start it manually per README.", err=True)
-        return False
-    # Guard against spawning DUPLICATE GPU servers across re-execs / repeated
-    # heals: if we already started one and it's still alive, just wait for it.
-    pidfile = Path(cfg.log_dir) / ".tts_autostart.pid"
-    try:
-        if pidfile.exists():
-            old = int(pidfile.read_text().strip() or "0")
-            if old > 0:
-                os.kill(old, 0)                    # raises if the process is gone
-                log(f"[heal] a TTS autostart is already running (pid {old}); waiting.", err=True)
-                t0 = time.time()
-                while time.time() - t0 < timeout:
-                    time.sleep(5)
-                    if _tts_reachable(cfg):
-                        return True
-                return _tts_reachable(cfg)
-    except Exception:
-        pass   # stale/dead pid -> fall through and (re)spawn exactly one
-    import re
-    m = re.search(r":(\d+)", cfg.omni_server_url)
-    port = m.group(1) if m else "8133"
-    env = dict(os.environ)
-    env.update({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                "OMNI_MODEL": cfg.omni_model, "OMNI_REF": cfg.omni_ref_wav,
-                "OMNI_REFTXT_FILE": cfg.omni_ref_txt, "OMNI_LANG": cfg.omni_lang})
-    cmd = [omni_py, "-m", "uvicorn", "omnivoice_server:app",
-           "--host", "127.0.0.1", "--port", port, "--app-dir", app_dir]
-    log(f"[heal] autostarting OmniVoice TTS server: {' '.join(cmd)}", err=True)
-    try:
-        Path(cfg.log_dir).mkdir(parents=True, exist_ok=True)
-        with open(Path(cfg.log_dir) / "tts_server.log", "a") as logf:
-            proc = subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT)
-        pidfile.write_text(str(proc.pid))          # record so we don't double-spawn
-    except Exception as e:
-        log(f"[heal] TTS autostart failed: {e}", err=True)
-        return False
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        time.sleep(5)
+    # Serialize the whole check-then-spawn: called concurrently from the parallel
+    # synth ThreadPool, an unlocked guard lets N threads all fall through and spawn
+    # N duplicate GPU servers. Double-check reachability once we hold the lock so a
+    # thread that waited while a peer healed becomes a no-op instead of respawning.
+    with _TTS_AUTOSTART_LOCK:
         if _tts_reachable(cfg):
-            log("[heal] TTS server is up.")
             return True
-    log("[heal] TTS server did not become reachable in time.", err=True)
-    return False
+        omni_py = os.environ.get("TMV_OMNI_VENV_PY", "/root/venv-omni/bin/python")
+        app_dir = os.environ.get("TMV_OMNI_APP_DIR", str(Path(cfg.root) / "app"))
+        if not (Path(omni_py).exists() and Path(app_dir).exists()):
+            log(f"[heal] cannot autostart TTS (missing {omni_py} or {app_dir}); "
+                "start it manually per README.", err=True)
+            return False
+        # Guard against spawning DUPLICATE GPU servers across re-execs / repeated
+        # heals: if we already started one and it's still alive, just wait for it.
+        pidfile = Path(cfg.log_dir) / ".tts_autostart.pid"
+        try:
+            if pidfile.exists():
+                old = int(pidfile.read_text().strip() or "0")
+                if old > 0:
+                    os.kill(old, 0)                # raises if the process is gone
+                    log(f"[heal] a TTS autostart is already running (pid {old}); waiting.", err=True)
+                    t0 = time.time()
+                    while time.time() - t0 < timeout:
+                        time.sleep(5)
+                        if _tts_reachable(cfg):
+                            return True
+                    return _tts_reachable(cfg)
+        except Exception:
+            pass   # stale/dead pid -> fall through and (re)spawn exactly one
+        import re
+        m = re.search(r":(\d+)", cfg.omni_server_url)
+        port = m.group(1) if m else "8133"
+        env = dict(os.environ)
+        env.update({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                    "OMNI_MODEL": cfg.omni_model, "OMNI_REF": cfg.omni_ref_wav,
+                    "OMNI_REFTXT_FILE": cfg.omni_ref_txt, "OMNI_LANG": cfg.omni_lang})
+        cmd = [omni_py, "-m", "uvicorn", "omnivoice_server:app",
+               "--host", "127.0.0.1", "--port", port, "--app-dir", app_dir]
+        log(f"[heal] autostarting OmniVoice TTS server: {' '.join(cmd)}", err=True)
+        try:
+            Path(cfg.log_dir).mkdir(parents=True, exist_ok=True)
+            with open(Path(cfg.log_dir) / "tts_server.log", "a") as logf:
+                proc = subprocess.Popen(cmd, env=env, stdout=logf, stderr=subprocess.STDOUT)
+            pidfile.write_text(str(proc.pid))      # record so we don't double-spawn
+        except Exception as e:
+            log(f"[heal] TTS autostart failed: {e}", err=True)
+            return False
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            time.sleep(5)
+            if _tts_reachable(cfg):
+                log("[heal] TTS server is up.")
+                return True
+        log("[heal] TTS server did not become reachable in time.", err=True)
+        return False
 
 
 # =========================================================================== #
@@ -1862,15 +1930,29 @@ def _build_s2s_manifest(cfg):
     user's spoken instruction with OmniVoice from Turkish instruction text."""
     man = Path(cfg.data_dir) / "s2s.jsonl"
     target = cfg.n_general_s2s
+    audio_root = Path(cfg.synth_dir) / "s2s_audio"
     if man.exists() and _manifest_count(man) >= target:
-        log(f"s2s manifest already has {_manifest_count(man)} rows — done.")
+        frac = _audio_frac(man)
+        if frac >= 0.5:                       # complete WITH speech -> no TTS needed
+            log(f"s2s manifest already has {_manifest_count(man)} rows "
+                f"(speech {frac:.0%}) — done.")
+            return
+        # rows exist but are TEXT-only -> construct TTS lazily (only here, so a
+        # complete resume never autostarts an idle GPU server) and BACKFILL.
+        tts = TTSBackend()
+        if not tts.available():
+            log(f"s2s manifest already has {_manifest_count(man)} rows "
+                f"(speech {frac:.0%}; TTS still unreachable) — done for now.")
+            return
+        log(f"s2s manifest is text-only (speech {frac:.0%}) and TTS is now reachable "
+            "-> backfilling input speech.", err=True)
+        _backfill_manifest_audio(cfg, man, audio_root, "s2s", tts)
         return
     tts = TTSBackend()
     if not tts.available():
         log("  TTS unavailable -> writing TEXT-only s2s pairs (speech synth deferred). "
             "Start your OmniVoice server and re-run `data --only s2s` before training.", err=True)
     log(f"Building general S2S manifest -> {man}")
-    audio_root = Path(cfg.synth_dir) / "s2s_audio"
     audio_root.mkdir(parents=True, exist_ok=True)
     already = _manifest_count(man)
     written = already
@@ -1924,15 +2006,30 @@ def _build_medical_triples(cfg, gaz, n, use_teacher=False):
     speech, plus gazetteer-seeded code-switched examples. Optionally augment with
     a teacher LLM (sequence-level KD)."""
     man = Path(cfg.data_dir) / "medical.jsonl"
+    audio_root = Path(cfg.synth_dir) / "medical_audio"
     if man.exists() and _manifest_count(man) >= n:
-        log(f"medical manifest already has {_manifest_count(man)} rows — done.")
+        frac = _audio_frac(man)
+        if frac >= 0.5:                       # complete WITH speech -> no TTS needed
+            log(f"medical manifest already has {_manifest_count(man)} rows "
+                f"(speech {frac:.0%}) — done.")
+            return
+        # TEXT-only rows -> construct TTS lazily here only, then BACKFILL input speech
+        # (pronunciation-rewritten, same as the build path) instead of skipping.
+        tts = TTSBackend()
+        if not tts.available():
+            log(f"medical manifest already has {_manifest_count(man)} rows "
+                f"(speech {frac:.0%}; TTS still unreachable) — done for now.")
+            return
+        log(f"medical manifest is text-only (speech {frac:.0%}) and TTS is now reachable "
+            "-> backfilling input speech.", err=True)
+        _backfill_manifest_audio(cfg, man, audio_root, "med", tts,
+                                 text_transform=lambda t: apply_pronunciation(t, gaz))
         return
     tts = TTSBackend()
     if not tts.available():
         log("  TTS unavailable -> writing TEXT-only medical pairs (speech synth deferred). "
             "Start your OmniVoice server and re-run `data --only medical` before training.", err=True)
     log(f"Building medical triples -> {man} (target {n}, teacher={use_teacher})")
-    audio_root = Path(cfg.synth_dir) / "medical_audio"
     audio_root.mkdir(parents=True, exist_ok=True)
     already = _manifest_count(man)
     written = already
@@ -2135,6 +2232,85 @@ def _manifest_count(path):
     if not Path(path).exists():
         return 0
     return sum(1 for _ in open(path, "r", encoding="utf-8"))
+
+
+def _audio_frac(path):
+    """Fraction of manifest rows carrying an audio path (streaming, key-based).
+    Used to detect a TEXT-only build (OmniVoice was down during `data`) so we can
+    backfill/refuse instead of silently training a speech-less model."""
+    total = have = 0
+    try:
+        f = open(path, "r", encoding="utf-8")
+    except FileNotFoundError:
+        return 0.0
+    with f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            total += 1
+            try:
+                a = json.loads(line).get("audio")
+                # count only a row whose audio FILE exists and is a real WAV
+                # (>44-byte header) — a bare key can point at a missing/empty file.
+                if a and os.path.exists(a) and os.path.getsize(a) > 44:
+                    have += 1
+            except Exception:
+                pass
+    return have / total if total else 0.0
+
+
+def _rewrite_jsonl(path, rows):
+    """Atomically rewrite a JSONL manifest (tmp + os.replace) so a crash mid-write
+    can never leave a half-truncated manifest."""
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def _backfill_manifest_audio(cfg, man, audio_root, prefix, tts, text_transform=None):
+    """SELF-HEAL: a manifest was written TEXT-only because OmniVoice was down during
+    `data`; now that TTS is reachable, synthesize the missing INPUT speech and rewrite
+    the manifest in place. Idempotent — only rows without a usable audio file are
+    (re)synthesized; progress is persisted after every chunk so it resumes on crash."""
+    rows = read_jsonl(man)
+    todo = [i for i, r in enumerate(rows)
+            if r.get("instruction_text") and not (r.get("audio") and Path(r["audio"]).exists())]
+    if not todo:
+        return 0
+    audio_root = Path(audio_root)
+    audio_root.mkdir(parents=True, exist_ok=True)
+    log(f"[backfill] {man.name}: synthesizing input speech for {len(todo)} text-only rows ...")
+    workers = max(1, cfg.synth_workers)
+    batch = max(1, workers * 8)
+    # Rewrite the FULL manifest at most every ~2000 new rows, not every chunk:
+    # _rewrite_jsonl re-serializes ALL rows, so per-chunk rewrites are O(n^2) on a
+    # 120k-row hardcore manifest. Crash-safe because the todo filter re-selects any
+    # row still lacking a real audio file on the next run.
+    ckpt_every = max(1, math.ceil(2000 / batch))
+    done = 0
+    for chunk_i, s in enumerate(range(0, len(todo), batch)):
+        idxs = todo[s:s + batch]
+        jobs = []
+        for i in idxs:
+            txt = str(rows[i]["instruction_text"])[:600]
+            txt = text_transform(txt) if text_transform else txt
+            jobs.append((i, txt, str(audio_root / f"{prefix}_{i:07d}.wav")))
+        oks = _flush_synth(tts, [(t, p) for (_i, t, p) in jobs], workers)
+        for i, _t, path in jobs:
+            # set the key ONLY after confirming a real, non-empty WAV was written
+            if oks.get(path) and os.path.exists(path) and os.path.getsize(path) > 44:
+                rows[i]["audio"] = path
+                done += 1
+        if (chunk_i + 1) % ckpt_every == 0:
+            _rewrite_jsonl(man, rows)      # periodic crash-safe checkpoint
+            log(f"  [backfill] {man.name}: {done}/{len(todo)} rows have audio")
+    _rewrite_jsonl(man, rows)              # final flush (always persist trailing work)
+    log(f"[backfill] {man.name}: added audio to {done}/{len(todo)} rows.")
+    return done
 
 
 # =========================================================================== #
@@ -2603,6 +2779,9 @@ class NativeSpeechLLM:
         import torch
         import numpy as np
         arr = np.asarray(wav_16k, dtype="float32").reshape(-1)
+        cap = int(self.cfg.max_audio_sec * 16000)
+        if cap > 0 and arr.shape[0] > cap:
+            arr = arr[:cap]                       # bound speech tokens -> bound peak VRAM
         dur = len(arr) / 16000.0
         feats = self.feat(arr, sampling_rate=16000, return_tensors="pt").input_features
         feats = feats.to(self.device, dtype=torch.bfloat16)
@@ -2753,7 +2932,8 @@ def cmd_train(args):
     # manifest has little/no audio (e.g. OmniVoice was down during `data`), we
     # would silently train a TEXT-only model and the benchmark would measure the
     # wrong thing. Refuse unless explicitly overridden.
-    audio_rows = sum(1 for r in rows if r.get("audio"))
+    audio_rows = sum(1 for r in rows if r.get("audio")
+                     and os.path.exists(r["audio"]) and os.path.getsize(r["audio"]) > 44)
     frac = audio_rows / max(1, len(rows))
     if stage in ("align", "s2s", "medical") and frac < 0.5:
         log(f"WARNING: only {audio_rows}/{len(rows)} ({frac:.0%}) rows carry speech audio.",
@@ -2984,6 +3164,7 @@ def _train_loop(cfg, stage, rows, init_dir=None, resume=False):
                 torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
                 opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
                 pending = False; global_step += 1; steps_this_epoch += 1
+                _vram_watchdog(cfg)                 # proactive OOM-avoidance
                 cur_lr = sched.get_last_lr()[0]
                 if global_step % cfg.log_steps == 0:
                     used, total = gpu_mem_gb()
@@ -4210,11 +4391,24 @@ def cmd_auto(args):
             cmd_data(_ap.Namespace(only=None, n_medical=None, use_teacher=args.use_teacher))
             counts = {m: _manifest_count(Path(CFG.data_dir) / f"{m}.jsonl")
                       for m in ("align", "s2s", "medical")}
-            log(f"[auto] data manifests: {counts}")
+            fracs = {m: _audio_frac(Path(CFG.data_dir) / f"{m}.jsonl")
+                     for m in ("align", "s2s", "medical")}
+            speech_pct = ", ".join("%s:%.0f%%" % (m, 100 * fracs[m]) for m in fracs)
+            log(f"[auto] data manifests: {counts}  speech%=[{speech_pct}]")
             ok = counts["align"] >= 100 and counts["s2s"] >= 1 and counts["medical"] >= 1
             if not ok:
                 log("[auto] data produced empty/undersized manifests — likely a "
                     "network or OmniVoice-TTS outage. NOT marking data done.", err=True)
+            # A voice-to-voice model needs INPUT SPEECH: refuse to mark data done if
+            # s2s/medical came out text-only (OmniVoice was down). The builders will
+            # BACKFILL the audio automatically on the next `auto` once :8133 is up.
+            elif not args.allow_textonly and (fracs["s2s"] < 0.5 or fracs["medical"] < 0.5):
+                log(f"[auto] s2s/medical are TEXT-ONLY (speech s2s:{fracs['s2s']:.0%} "
+                    f"medical:{fracs['medical']:.0%}) — OmniVoice TTS was unreachable. NOT "
+                    "marking data done; start your :8133 server and re-run `auto` (input "
+                    "speech will be backfilled). Or pass --allow-textonly to train text-only.",
+                    err=True)
+                ok = False
             return ok
         if step.startswith("train:"):
             st = step.split(":", 1)[1]
