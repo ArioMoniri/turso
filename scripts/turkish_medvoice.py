@@ -1044,20 +1044,27 @@ class TTSBackend:
         self._init()
 
     def _init(self):
-        # (1) python API
-        try:
-            import omnivoice  # noqa
-            # The package exposes a synthesizer; we probe a couple of known entry
-            # points and keep whichever imports. If the exact class differs on
-            # your build, set TMV_OMNI_URL and we'll use the HTTP path instead.
-            self._py = _try_load_omnivoice_py(self.cfg)
-            if self._py is not None:
-                self.mode = "python"
+        # TMV_TTS_MODE = auto | http | python.
+        #   http   -> use your running OmniVoice server (which loads your Turkish
+        #             fine-tune omnivoice-ft1 via OMNI_MODEL) — RECOMMENDED so the
+        #             fine-tune is used, not the base model the pip package pulls.
+        #   python -> in-process `omnivoice` package (downloads/uses BASE OmniVoice).
+        #   auto   -> python if it loads, else http.
+        mode_pref = os.environ.get("TMV_TTS_MODE", "auto").lower()
+        # (1) python API (base OmniVoice) — skipped when http is forced
+        if mode_pref in ("auto", "python"):
+            try:
+                import omnivoice  # noqa
+                self._py = _try_load_omnivoice_py(self.cfg)
+                if self._py is not None:
+                    self.mode = "python"
+                    return
+            except Exception:
+                pass
+            if mode_pref == "python":
+                self.mode = None
                 return
-        except Exception:
-            pass
-        # (2) HTTP endpoint (your running server) — SELF-HEAL: if it's down, try to
-        # autostart it before giving up.
+        # (2) HTTP endpoint (your omnivoice-ft1 server) — SELF-HEAL: autostart if down
         if _tts_reachable(self.cfg) or _ensure_tts_server(self.cfg):
             self.mode = "http"
             return
