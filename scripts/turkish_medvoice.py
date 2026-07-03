@@ -902,6 +902,7 @@ PIP_OPTIONAL = [
     "vllm>=0.17", "qwen-omni-utils[decord]",        # teacher / judge inference
     "git+https://github.com/sarulab-speech/UTMOSv2.git",   # UTMOS MOS predictor
     "phonemizer",                                   # medical G2P (needs espeak-ng)
+    "openpyxl",                                      # parse the TITCK drug XLSX
 ]
 TORCH_INDEX = "https://download.pytorch.org/whl/cu128"
 # system packages needed so compiled wheels (webrtcvad, etc.) can build, and for
@@ -1108,6 +1109,9 @@ def _smoke_test():
 
 # INN -> Turkish orthographic/phonetic override so OmniVoice says Latin drug
 # names the way a Turkish clinician does. Extend freely.
+# INN (Latin) -> Turkish orthography. Drug names are the HIGHEST-stakes class for a
+# spoken assistant (LASA confusion) — both spellings are added as atomic tokens and
+# the Turkish form drives OmniVoice pronunciation. Enrich further from TITCK at runtime.
 DRUG_PRONUNCIATION = {
     "ceftriaxone": "seftriakson", "ciprofloxacin": "siprofloksasin",
     "amoxicillin": "amoksisilin", "paracetamol": "parasetamol",
@@ -1118,7 +1122,61 @@ DRUG_PRONUNCIATION = {
     "levothyroxine": "levotiroksin", "prednisolone": "prednizolon",
     "furosemide": "furosemid", "insulin": "insülin",
     "diazepam": "diazepam", "amlodipine": "amlodipin",
+    "amoxicillin/clavulanate": "amoksisilin klavulanat", "acetylsalicylic acid": "asetilsalisilik asit",
+    "clarithromycin": "klaritromisin", "cephalexin": "sefaleksin", "doxycycline": "doksisiklin",
+    "metronidazole": "metronidazol", "fluconazole": "flukonazol", "acyclovir": "asiklovir",
+    "pantoprazole": "pantoprazol", "lansoprazole": "lansoprazol", "ranitidine": "ranitidin",
+    "metoclopramide": "metoklopramid", "ondansetron": "ondansetron", "domperidone": "domperidon",
+    "salbutamol": "salbutamol", "budesonide": "budesonid", "montelukast": "montelukast",
+    "prednisone": "prednizon", "dexamethasone": "deksametazon", "methylprednisolone": "metilprednizolon",
+    "losartan": "losartan", "valsartan": "valsartan", "ramipril": "ramipril", "enalapril": "enalapril",
+    "bisoprolol": "bisoprolol", "metoprolol": "metoprolol", "carvedilol": "karvedilol",
+    "hydrochlorothiazide": "hidroklorotiyazid", "spironolactone": "spironolakton",
+    "simvastatin": "simvastatin", "rosuvastatin": "rosuvastatin", "ezetimibe": "ezetimib",
+    "gliclazide": "gliklazid", "empagliflozin": "empagliflozin", "sitagliptin": "sitagliptin",
+    "sertraline": "sertralin", "escitalopram": "essitalopram", "fluoxetine": "fluoksetin",
+    "quetiapine": "ketiyapin", "olanzapine": "olanzapin", "risperidone": "risperidon",
+    "gabapentin": "gabapentin", "pregabalin": "pregabalin", "tramadol": "tramadol",
+    "diclofenac": "diklofenak", "naproxen": "naproksen", "codeine": "kodein", "morphine": "morfin",
+    "heparin": "heparin", "enoxaparin": "enoksaparin", "rivaroxaban": "rivaroksaban",
+    "apixaban": "apiksaban", "digoxin": "digoksin", "amiodarone": "amiodaron",
+    "levofloxacin": "levofloksasin", "moxifloxacin": "moksifloksasin", "vancomycin": "vankomisin",
+    "gentamicin": "gentamisin", "meropenem": "meropenem", "piperacillin/tazobactam": "piperasilin tazobaktam",
+    "phenytoin": "fenitoin", "carbamazepine": "karbamazepin", "valproate": "valproat",
+    "levetiracetam": "levetirasetam", "salmeterol": "salmeterol", "tiotropium": "tiotropiyum",
 }
+
+# LASA (look-alike/sound-alike) Turkish drug groups — SAFETY-CRITICAL: force-included as
+# atomic tokens so the model emits each name whole and never drifts into a look-alike
+# mid-word. Sourced from Turkish hospital 'Okunuşu/Yazılışı Benzer İlaçlar' lists + TITCK.
+LASA_PAIRS = [
+    ["losec", "lasix"], ["coraspin", "coumadin"], ["aspirin", "coraspin", "ecopirin"],
+    ["plavix", "karum", "pingel"], ["beloc", "belok"], ["tramadol", "trazodon"],
+    ["sertralin", "setirizin"], ["klorpromazin", "klorpropamid"], ["vinkristin", "vinblastin"],
+    ["sisplatin", "karboplatin"], ["hidralazin", "hidroksizin"], ["glipizid", "gliklazid"],
+    ["klonazepam", "klobazam"], ["dopamin", "dobutamin"], ["efedrin", "epinefrin"],
+    ["morfin", "hidromorfon"], ["heparin", "hesperidin"], ["metformin", "metronidazol"],
+    ["prednizon", "prednizolon"], ["nifedipin", "nimodipin"], ["amlodipin", "amiodaron"],
+    ["parol", "paranox"], ["novalgin", "novasen"], ["augmentin", "unasyn"],
+]
+
+# dose/unit tokens spoken aloud (high stakes if mis-said)
+DOSE_UNITS = ["miligram", "mikrogram", "gram", "mililitre", "ünite", "tablet", "ampul",
+              "kapsül", "damla", "ölçek", "mg/kg", "mg", "ml", "günde", "saatte",
+              "sabah", "akşam", "öğle", "aç karnına", "tok karnına"]
+
+# common Turkish anatomy / symptom / procedure surface forms (what patients say)
+ANATOMY_SYMPTOM = [
+    "akciğer", "karaciğer", "böbrek", "pankreas", "dalak", "mide", "bağırsak",
+    "yemek borusu", "safra kesesi", "prostat", "tiroit", "diyafram", "koroner",
+    "miyokart", "ventrikül", "atriyum", "aort", "damar", "toplardamar", "atardamar",
+    "baş dönmesi", "bulantı", "kusma", "ishal", "kabızlık", "öksürük", "hırıltı",
+    "ateş", "titreme", "çarpıntı", "bayılma", "uyuşma", "karıncalanma", "ödem",
+    "kaşıntı", "döküntü", "şişlik", "halsizlik", "iştahsızlık", "kilo kaybı",
+    "elektrokardiyografi", "ultrasonografi", "tomografi", "manyetik rezonans",
+    "endoskopi", "kolonoskopi", "biyopsi", "anjiyografi", "diyaliz", "kemoterapi",
+    "radyoterapi", "ameliyat", "rehabilitasyon", "aşılama", "enjeksiyon",
+]
 
 SEED_ICD10_TR = [
     ("E11", "Tip 2 diabetes mellitus"), ("I10", "Esansiyel hipertansiyon"),
@@ -1127,6 +1185,12 @@ SEED_ICD10_TR = [
     ("R51", "Baş ağrısı"), ("I21", "Akut miyokart enfarktüsü"),
     ("C34", "Bronş ve akciğer malign neoplazmı"), ("E78", "Lipoprotein metabolizması bozukluğu"),
     ("F41", "Anksiyete bozukluğu"), ("G43", "Migren"), ("K21", "Gastroözofageal reflü"),
+    ("E03", "Hipotiroidizm"), ("E05", "Hipertiroidizm"), ("I48", "Atriyal fibrilasyon"),
+    ("I50", "Kalp yetmezliği"), ("J44", "Kronik obstrüktif akciğer hastalığı"),
+    ("N18", "Kronik böbrek hastalığı"), ("K80", "Safra taşı"), ("N20", "Böbrek taşı"),
+    ("M17", "Diz osteoartriti"), ("M79", "Fibromiyalji"), ("G40", "Epilepsi"),
+    ("F32", "Depresyon"), ("B18", "Kronik viral hepatit"), ("D50", "Demir eksikliği anemisi"),
+    ("L20", "Atopik dermatit"), ("J30", "Alerjik rinit"), ("H66", "Orta kulak iltihabı"),
 ]
 
 
@@ -1149,12 +1213,28 @@ def build_gazetteer(cfg):
         for w in desc.split():
             if len(w) > 4:
                 add(w, "tr", "diagnosis_token")
-    # seed: EN drug INNs (+ TR pronunciation)
+    # seed: EN drug INNs (+ TR pronunciation) — both spellings
     for inn, pron in DRUG_PRONUNCIATION.items():
         add(inn, "en", "drug", pron)
         add(pron, "tr", "drug")
+    # seed: LASA (sound-alike) drug names — safety-critical, atomic tokens
+    for group in LASA_PAIRS:
+        for name in group:
+            add(name, "tr", "lasa")
+    # seed: dose/unit + anatomy/symptom/procedure surface forms
+    for u in DOSE_UNITS:
+        add(u, "tr", "dose")
+    for a in ANATOMY_SYMPTOM:
+        add(a, "tr", "anatomy")
 
-    # optional: pull more approved drug names from ChEMBL if the MCP/HTTP is reachable
+    # OPTIONAL: real TITCK Turkish drug list (best-effort; scrape the rotating XLSX
+    # link, parse the active-ingredient column). Falls back silently to the seeds.
+    try:
+        _ingest_titck_drugs(cfg, add)
+    except Exception as e:
+        log(f"  TITCK enrichment skipped: {e}")
+
+    # optional: pull more approved drug names from ChEMBL if reachable
     try:
         import requests
         for q in ["metformin", "amoxicillin", "atorvastatin"]:
@@ -2048,56 +2128,113 @@ TR_SUFFIXES = ["ları", "leri", "larında", "lerinde", "larından", "lerinden",
                "iyor", "uyor", "üyor", "dan", "den", "tan", "ten", "nın", "nin"]
 
 
+CLASS_WEIGHT = {"drug": 3.0, "lasa": 3.0, "dose": 2.5, "diagnosis": 2.0,
+                "diagnosis_token": 1.5, "anatomy": 1.5, "general": 1.0, "suffix": 1.0}
+
+
+def _ingest_titck_drugs(cfg, add):
+    """Best-effort: fetch the real TITCK Turkish active-ingredient (etkin madde)
+    list, add each name as a drug token. Opt-in (TMV_USE_TITCK=1) because it scrapes
+    a rotating-URL XLSX and needs openpyxl; falls back silently to the built-in seeds."""
+    if os.environ.get("TMV_USE_TITCK", "0") != "1":
+        return
+    import re
+    import requests
+    import openpyxl
+    log("[titck] fetching Turkish active-ingredient list (TMV_USE_TITCK=1) ...")
+    hdr = {"User-Agent": "Mozilla/5.0"}
+    idx = requests.get("https://www.titck.gov.tr/dinamikmodul/108", timeout=25, headers=hdr)
+    links = re.findall(r'href="([^"]*EtkinMaddeListesi[^"]*\.xlsx)"', idx.text)
+    if not links:
+        log("[titck] no XLSX link on listing page.", err=True)
+        return
+    url = links[0] if links[0].startswith("http") else "https://www.titck.gov.tr" + links[0]
+    xls = Path(cfg.data_dir) / "titck_etkin_madde.xlsx"
+    xls.write_bytes(requests.get(url, timeout=60, headers=hdr).content)
+    wb = openpyxl.load_workbook(xls, read_only=True)
+    n = 0
+    for row in wb.active.iter_rows(min_row=2, values_only=True):
+        if len(row) < 2 or not row[1]:
+            continue
+        for inn in str(row[1]).split(";"):
+            s = inn.strip().lower()
+            if 3 <= len(s) <= 40 and re.fullmatch(r"[a-zçğıöşü /()+-]+", s):
+                add(s, "tr", "drug"); n += 1
+    log(f"[titck] added {n} active-ingredient names.")
+
+
 def _mine_vocab_candidates(cfg, tok, k):
-    """Mine ~k Turkish/medical tokens that Qwen currently splits into >=3 pieces,
-    ranked by freq*(pieces-1). Sources: gazetteer + drug INNs (both spellings) +
-    Turkish suffixes + a streamed Turkish-medical corpus (medqa/fleurs)."""
+    """Mine ~k MEDICAL-FIRST Turkish tokens. Budget ~55% medical / 30% morphology /
+    15% general. Medical seeds (drugs both spellings, LASA sound-alike names, dose
+    units, diagnoses, anatomy) are HARD-INCLUDED (frequency-independent, pieces>=2 so
+    a 2-piece drug still qualifies) — a compression-only miner would drop rare-but-
+    deadly drug names. General words are mined from a large Turkish medical corpus."""
     import re
     from collections import Counter
-    log(f"[vocab] mining ~{k} Turkish+medical candidate tokens ...")
+    log(f"[vocab] mining ~{k} MEDICAL-first Turkish candidate tokens ...")
 
     def pieces(s):
         return len(tok(s, add_special_tokens=False).input_ids)
 
-    seed = []
     gaz = load_gazetteer(cfg)
-    for key, row in gaz.items():
+    # (a) medical seeds by class, hard-included; drugs/LASA kept at pieces>=2
+    seen, med = set(), []
+    for row in gaz.values():
+        typ = row.get("type", "general")
         for form in (row.get("term"), row.get("pron")):
-            if form and re.fullmatch(r"[A-Za-zçğıöşüÇĞİÖŞÜ]{4,}", str(form)):
-                seed.append(str(form).lower())
-    seed += TR_SUFFIXES
+            if not form:
+                continue
+            s = str(form).lower().strip()
+            if s in seen or not re.fullmatch(r"[a-zçğıöşü ]{3,40}", s):
+                continue
+            thr = 2 if typ in ("drug", "lasa", "dose") else 3
+            if pieces(s) >= thr:
+                med.append((s, CLASS_WEIGHT.get(typ, 1.0), pieces(s)))
+                seen.add(s)
+    med.sort(key=lambda t: t[1] * (t[2] - 1), reverse=True)
+    med_tokens = [s for s, _, _ in med]
+
+    # (b) morphology suffixes
+    morph = [s for s in TR_SUFFIXES if s not in seen and pieces(s) >= 2]
+    seen.update(morph)
+
+    # (c) general medical words mined from a large Turkish medical corpus (best-effort)
     freq = Counter()
-    # stream a Turkish-medical corpus for frequent long words
-    try:
-        ds = _hf_load(cfg.medqa_dataset, split="train", streaming=True)
-        n = 0
-        for ex in ds:
-            q, a = _extract_medqa(ex)
-            for txt in (q, a):
-                for w in re.findall(r"[a-zçğıöşü]{5,}", tr_lower(txt or "")):
-                    freq[w] += 1
-            n += 1
-            if n >= 4000:
-                break
-    except Exception as e:
-        log(f"  vocab corpus mining skipped ({e}).", err=True)
-    # score candidates: keep only those Qwen fragments into >=3 pieces
-    scored = {}
-    for w in list(freq) + seed:
-        if w in scored:
-            continue
-        p = pieces(w)
-        if p >= 3:
-            scored[w] = freq.get(w, 1) * (p - 1)
-    ranked = sorted(scored, key=lambda w: scored[w], reverse=True)
-    # always include the medical seeds up front (bounded), then top corpus words
-    out, seen = [], set()
-    for w in seed + ranked:
-        if w not in seen and pieces(w) >= 3:
-            out.append(w); seen.add(w)
+    for repo, split, col in (("iskenderulgen/turkish_medical_corpus", "train", "sentence"),
+                             (cfg.medqa_dataset, "train", None)):
+        try:
+            ds = _hf_load(repo, split=split, streaming=True)
+            n = 0
+            for ex in ds:
+                txts = [str(ex.get(col, ""))] if col else list(_extract_medqa(ex))
+                for txt in txts:
+                    for w in re.findall(r"[a-zçğıöşü]{6,}", tr_lower(txt or "")):
+                        freq[w] += 1
+                n += 1
+                if n >= 20000:
+                    break
+            break
+        except Exception as e:
+            log(f"  corpus {repo} mining skipped ({e}).", err=True)
+    general = sorted((w for w in freq if w not in seen and pieces(w) >= 3),
+                     key=lambda w: freq[w] * (pieces(w) - 1), reverse=True)
+
+    # (d) assemble to budget: medical first (~55%), then morphology (~30%), general
+    n_med = min(len(med_tokens), int(k * 0.55))
+    n_morph = min(len(morph), int(k * 0.30))
+    out = list(dict.fromkeys(med_tokens[:n_med]))
+    for w in morph[:n_morph]:
+        if w not in out:
+            out.append(w)
+    for w in general:
         if len(out) >= k:
             break
-    log(f"[vocab] mined {len(out)} candidate tokens (target {k}).")
+        if w not in out:
+            out.append(w)
+    out = out[:k]
+    med_set = set(med_tokens)
+    log(f"[vocab] mined {len(out)} tokens ({sum(1 for w in out if w in med_set)} medical, "
+        f"{n_morph} morphology, rest general).")
     return out
 
 
@@ -2962,24 +3099,34 @@ def eval_fertility(cfg):
         tr, _ = _load_fleurs_tr(cfg, 200)
     except Exception:
         tr = _MED_FERTILITY_TEXTS
+    # drug-name list (both spellings) — the highest-stakes class for a voice assistant
+    drugs = sorted({s for k, v in DRUG_PRONUNCIATION.items() for s in (k, v)})
+    diagnoses = [d for _c, d in SEED_ICD10_TR]
+
+    def _profile(t):
+        drug_single = sum(1 for d in drugs
+                          if len(t(d, add_special_tokens=False).input_ids) == 1)
+        return {"tr": _fertility(t, tr), "medical": _fertility(t, _MED_FERTILITY_TEXTS),
+                "drug": _fertility(t, drugs), "diagnosis": _fertility(t, diagnoses),
+                "drug_single_token_pct": round(100 * drug_single / max(1, len(drugs)), 1),
+                "vocab": len(t)}
+
     base = AutoTokenizer.from_pretrained(cfg.student_llm)
-    out = {"base": {"tr": _fertility(base, tr), "medical": _fertility(base, _MED_FERTILITY_TEXTS),
-                    "vocab": len(base)}}
+    out = {"base": _profile(base)}
     ext_dir = Path(cfg.stage_ckpt("medical")) / "tokenizer"
     if not ext_dir.exists():
         ext_dir = Path(cfg.stage_ckpt("vocab-ext")) / "tokenizer"
     if ext_dir.exists():
         try:
             ext = AutoTokenizer.from_pretrained(str(ext_dir))
-            out["extended"] = {"tr": _fertility(ext, tr),
-                               "medical": _fertility(ext, _MED_FERTILITY_TEXTS),
-                               "vocab": len(ext)}
-            b, e = out["base"]["medical"], out["extended"]["medical"]
-            out["medical_improvement_pct"] = round(100 * (b - e) / max(1e-6, b), 1)
+            out["extended"] = _profile(ext)
+            b, e = out["base"]["drug"], out["extended"]["drug"]
+            out["drug_fertility_improvement_pct"] = round(100 * (b - e) / max(1e-6, b), 1)
         except Exception as e:
             out["extended"] = {"error": str(e)}
-    log(f"    fertility base(tr/med)={out['base']['tr']}/{out['base']['medical']}"
-        + (f"  ext(med)={out.get('extended', {}).get('medical')}" if "extended" in out else ""))
+    log(f"    fertility base tr/med/drug={out['base']['tr']}/{out['base']['medical']}/"
+        f"{out['base']['drug']}  drug_single={out['base']['drug_single_token_pct']}%"
+        + (f"  ext_drug={out.get('extended', {}).get('drug')}" if "extended" in out else ""))
     return out
 
 
