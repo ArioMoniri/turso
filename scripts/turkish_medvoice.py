@@ -195,6 +195,34 @@ class Config:
     stage_epochs: dict = field(default_factory=lambda: {
         "align": 1, "s2s": 1, "medical": 3, "distill": 1})
 
+    # ---- serious-training knobs: LR schedule, regularization ----------------
+    lr_scheduler:  str = _env("TMV_SCHED", "cosine")          # cosine|linear|constant
+    warmup_ratio:  float = float(_env("TMV_WARMUP", "0.03"))
+    weight_decay:  float = float(_env("TMV_WD", "0.01"))
+    lora_targets_embed: bool = _env("TMV_LORA_EMBED", "0") == "1"
+
+    # ---- validation / best-checkpoint / early stopping ---------------------
+    val_fraction:  float = float(_env("TMV_VAL_FRAC", "0.01"))
+    eval_steps:    int = int(_env("TMV_EVAL_STEPS", "250"))
+    patience:      int = int(_env("TMV_PATIENCE", "5"))        # early-stop patience (# evals)
+    min_delta:     float = float(_env("TMV_MIN_DELTA", "0.002"))
+    length_bucket: bool = _env("TMV_LEN_BUCKET", "1") == "1"
+
+    # ---- knowledge distillation (distill stage) ----------------------------
+    kd_enable:     bool = _env("TMV_KD", "0") == "1"
+    kd_alpha:      float = float(_env("TMV_KD_ALPHA", "0.5"))  # weight of KL vs CE
+    kd_temp:       float = float(_env("TMV_KD_TEMP", "2.0"))
+    kd_teacher:    str = _env("TMV_KD_TEACHER", "Qwen/Qwen2.5-7B-Instruct")
+
+    # ---- data-synthesis throughput -----------------------------------------
+    synth_workers: int = int(_env("TMV_SYNTH_WORKERS", "1"))   # parallel TTS requests (http)
+
+    # ---- benchmark scope ---------------------------------------------------
+    bench_limit:     int = int(_env("TMV_BENCH_LIMIT", "200"))
+    bench_bootstrap: int = int(_env("TMV_BENCH_BOOT", "1000")) # CI resamples
+    bench_judge:     bool = _env("TMV_BENCH_JUDGE", "0") == "1"
+    preset:          str = _env("TMV_PRESET", "standard")      # smoke|standard|hardcore
+
     # ---- data --------------------------------------------------------------
     # (id, hf_config, split, audio_col, text_col, kind)   kind in {asr, instruct}
     asr_datasets: list = field(default_factory=lambda: [
@@ -245,6 +273,61 @@ class Config:
 
 
 CFG = Config()
+
+
+# =========================================================================== #
+#  PRESETS  — smoke (fast validation) | standard (solid) | hardcore (research) #
+#  A preset scales data size, epochs, LoRA rank, schedule, KD, and benchmark.  #
+#  Explicit TMV_* env vars always WIN over the preset (re-applied after).      #
+# =========================================================================== #
+
+def _apply_preset(cfg, name):
+    name = (name or "standard").lower()
+    if name == "smoke":
+        cfg.n_align, cfg.n_general_s2s, cfg.n_synth_medical = 3000, 800, 400
+        cfg.stage_epochs = {"align": 1, "s2s": 1, "medical": 1, "distill": 1}
+        cfg.lora_r, cfg.lora_alpha = 16, 32
+        cfg.bench_limit = 40
+        cfg.eval_steps, cfg.save_steps = 50, 200
+        cfg.kd_enable = False
+    elif name == "hardcore":
+        # research-grade. Data exists: InstrucTurca 2.6M, patient-doctor-qa 503K;
+        # align caps at the ~52K available ASR rows but trains more epochs.
+        cfg.n_align, cfg.n_general_s2s, cfg.n_synth_medical = 200000, 120000, 60000
+        cfg.stage_lr = {"align": 1e-4, "s2s": 2e-4, "medical": 1e-4, "distill": 7e-5}
+        cfg.stage_epochs = {"align": 2, "s2s": 3, "medical": 4, "distill": 2}
+        cfg.lora_r, cfg.lora_alpha = 64, 128
+        cfg.max_seq_len = max(cfg.max_seq_len, 4096)
+        cfg.warmup_ratio, cfg.weight_decay = 0.05, 0.01
+        cfg.bench_limit, cfg.bench_judge = 500, True
+        cfg.kd_enable = True
+        cfg.synth_workers = max(cfg.synth_workers, 6)
+        cfg.save_steps, cfg.eval_steps = 1000, 500
+    else:   # standard
+        name = "standard"
+        cfg.n_align, cfg.n_general_s2s, cfg.n_synth_medical = 60000, 40000, 20000
+        cfg.stage_epochs = {"align": 1, "s2s": 2, "medical": 3, "distill": 1}
+        cfg.lora_r, cfg.lora_alpha = 32, 64
+        cfg.bench_limit = 200
+    cfg.preset = name
+    _env_override(cfg)     # explicit env vars win over the preset
+    return name
+
+
+def _env_override(cfg):
+    """Re-apply explicit TMV_* overrides so they beat a preset (which runs first)."""
+    def _i(k):
+        return k in os.environ
+    if _i("TMV_N_ALIGN"): cfg.n_align = int(os.environ["TMV_N_ALIGN"])
+    if _i("TMV_N_S2S"):   cfg.n_general_s2s = int(os.environ["TMV_N_S2S"])
+    if _i("TMV_N_MED"):   cfg.n_synth_medical = int(os.environ["TMV_N_MED"])
+    if _i("TMV_LORA_R"):  cfg.lora_r = int(os.environ["TMV_LORA_R"])
+    if _i("TMV_LORA_ALPHA"): cfg.lora_alpha = int(os.environ["TMV_LORA_ALPHA"])
+    if _i("TMV_MAXSEQ"):  cfg.max_seq_len = int(os.environ["TMV_MAXSEQ"])
+    if _i("TMV_BENCH_LIMIT"): cfg.bench_limit = int(os.environ["TMV_BENCH_LIMIT"])
+    if _i("TMV_KD"):      cfg.kd_enable = os.environ["TMV_KD"] == "1"
+    if _i("TMV_SYNTH_WORKERS"): cfg.synth_workers = int(os.environ["TMV_SYNTH_WORKERS"])
+    if _i("TMV_EVAL_STEPS"): cfg.eval_steps = int(os.environ["TMV_EVAL_STEPS"])
 
 
 # =========================================================================== #
@@ -653,6 +736,35 @@ def _synth(tts, text, out_path=None):
     the whole data build (tune with TMV_SYNTH_TIMEOUT seconds)."""
     to = int(os.environ.get("TMV_SYNTH_TIMEOUT", "90"))
     return _call_with_timeout(tts.synth, to, text, out_path=out_path)
+
+
+def _flush_synth(tts, jobs, workers):
+    """Synthesize a batch of (text, out_path) jobs. When workers>1 AND the backend
+    is the HTTP server (thread-safe, has its own request timeout), run them
+    concurrently for a big throughput win on large (hardcore) data builds. Returns
+    {out_path: ok_bool}."""
+    results = {}
+    if workers <= 1 or getattr(tts, "mode", None) != "http":
+        for text, path in jobs:
+            try:
+                _synth(tts, text, path); results[path] = True
+            except Exception as e:
+                log(f"  synth failed: {e}", err=True); results[path] = False
+        return results
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(job):
+        text, path = job
+        try:
+            tts.synth(text, out_path=path)   # HTTP request timeout guards hangs off-thread
+            return path, True
+        except Exception as e:
+            log(f"  synth failed: {e}", err=True)
+            return path, False
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for path, ok in ex.map(_one, jobs):
+            results[path] = ok
+    return results
 
 
 # =========================================================================== #
@@ -1495,32 +1607,47 @@ def _build_s2s_manifest(cfg):
     already = _manifest_count(man)
     written = already
     seen = 0
+    workers = max(1, cfg.synth_workers)
+    flush_n = max(1, workers * 8)
+    buffer = []                              # (row, text_or_None, wav_path_or_None)
+
+    def _flush():
+        nonlocal written
+        if not buffer:
+            return
+        jobs = [(t, p) for (_r, t, p) in buffer if t is not None]
+        oks = _flush_synth(tts, jobs, workers) if jobs else {}
+        for row, text, path in buffer:
+            if text is not None and oks.get(path):
+                row["audio"] = path
+            append_jsonl(man, row)
+            written += 1
+        buffer.clear()
+        log(f"  s2s: {written} rows")
+
     try:
         ds = _hf_load(cfg.instruct_dataset, split="train", streaming=True)
     except Exception as e:
         log(f"  {cfg.instruct_dataset} load failed: {e}", err=True)
         return
     for ex in ds:
-        if written >= target:
+        if written + len(buffer) >= target:
             break
         instr, resp = _extract_instruct(ex)
         if not instr or not resp:
             continue
         seen += 1
-        if seen <= already:
+        if seen <= already:                  # already written on a previous run
             continue
         row = {"prompt": "", "target": resp, "kind": "s2s", "instruction_text": instr}
         if tts.available():
-            try:
-                wav_path = str(audio_root / f"s2s_{written:07d}.wav")
-                _synth(tts, instr[:600], wav_path)
-                row["audio"] = wav_path
-            except Exception as e:
-                log(f"  synth failed at {written}: {e}", err=True)
-        append_jsonl(man, row)
-        written += 1
-        if written % 1000 == 0:
-            log(f"  s2s: {written} rows")
+            wav_path = str(audio_root / f"s2s_{written + len(buffer):07d}.wav")
+            buffer.append((row, instr[:600], wav_path))
+        else:
+            buffer.append((row, None, None))
+        if len(buffer) >= flush_n:
+            _flush()
+    _flush()
     log(f"s2s manifest: {written} rows")
 
 
@@ -1542,6 +1669,23 @@ def _build_medical_triples(cfg, gaz, n, use_teacher=False):
     already = _manifest_count(man)
     written = already
     seen = 0
+    workers = max(1, cfg.synth_workers)
+    flush_n = max(1, workers * 8)
+    buffer = []
+
+    def _flush():
+        nonlocal written
+        if not buffer:
+            return
+        jobs = [(t, p) for (_r, t, p) in buffer if t is not None]
+        oks = _flush_synth(tts, jobs, workers) if jobs else {}
+        for row, text, path in buffer:
+            if text is not None and oks.get(path):
+                row["audio"] = path
+            append_jsonl(man, row)
+            written += 1
+        buffer.clear()
+        log(f"  medical: {written} rows")
 
     # (a) real gold Q&A -> best targets, avoids re-transcription error loops
     try:
@@ -1550,7 +1694,7 @@ def _build_medical_triples(cfg, gaz, n, use_teacher=False):
         log(f"  {cfg.medqa_dataset} load failed: {e}", err=True)
         ds = []
     for ex in ds:
-        if written >= n:
+        if written + len(buffer) >= n:
             break
         q, a = _extract_medqa(ex)
         if not q or not a:
@@ -1560,17 +1704,14 @@ def _build_medical_triples(cfg, gaz, n, use_teacher=False):
             continue
         row = {"prompt": "", "target": a, "kind": "medical", "instruction_text": q}
         if tts.available():
-            try:
-                spoken = apply_pronunciation(q[:600], gaz)
-                wav_path = str(audio_root / f"med_{written:07d}.wav")
-                _synth(tts, spoken, wav_path)
-                row["audio"] = wav_path
-            except Exception as e:
-                log(f"  synth failed at {written}: {e}", err=True)
-        append_jsonl(man, row)
-        written += 1
-        if written % 500 == 0:
-            log(f"  medical: {written} rows")
+            spoken = apply_pronunciation(q[:600], gaz)
+            wav_path = str(audio_root / f"med_{written + len(buffer):07d}.wav")
+            buffer.append((row, spoken, wav_path))
+        else:
+            buffer.append((row, None, None))
+        if len(buffer) >= flush_n:
+            _flush()
+    _flush()
 
     # (b) optional teacher augmentation (code-switched, gazetteer-seeded)
     if use_teacher and written < n:
@@ -1801,11 +1942,15 @@ def build_model(cfg, for_training=True, adapter_dir=None):
         elif cfg.grad_ckpt:
             llm.gradient_checkpointing_enable()
             llm.enable_input_require_grads()
+        _targets = ["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"]
+        _modules_to_save = None
+        if cfg.lora_targets_embed:
+            _modules_to_save = ["embed_tokens", "lm_head"]   # full-train these small heads
         lcfg = LoraConfig(r=cfg.lora_r, lora_alpha=cfg.lora_alpha,
                           lora_dropout=cfg.lora_dropout, bias="none",
-                          task_type="CAUSAL_LM",
-                          target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                                          "gate_proj", "up_proj", "down_proj"])
+                          task_type="CAUSAL_LM", target_modules=_targets,
+                          modules_to_save=_modules_to_save)
         llm = get_peft_model(llm, lcfg)
         # resume / curriculum init: load saved LoRA weights into this fresh adapter
         if adapter_dir and Path(adapter_dir, "lora").exists():
@@ -2057,95 +2202,179 @@ def cmd_train(args):
 
 
 def _train_loop(cfg, stage, rows, init_dir=None, resume=False):
+    import math
     import random
     import torch
     from bitsandbytes.optim import PagedAdamW8bit
+    from transformers import get_scheduler
 
     ckpt_dir = cfg.stage_ckpt(stage)
+    best_dir = str(Path(ckpt_dir) / "best")
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
     state_path = Path(ckpt_dir) / "trainer_state.json"
+    metrics_path = Path(cfg.log_dir) / f"metrics_{stage}.jsonl"
 
-    # Choose where adapters come from: a real checkpoint for this stage takes
-    # priority on --resume; otherwise fall back to the curriculum init_dir. This
-    # matters for the OOM re-exec, which passes --resume even before any
-    # checkpoint has been written — without this it would lose the previous stage.
+    # adapters: this stage's checkpoint on --resume, else the curriculum init_dir
     have_ckpt = Path(ckpt_dir, "projector.pt").exists()
     adapter_dir = ckpt_dir if (resume and have_ckpt) else init_dir
     model, tok, feat = build_model(cfg, for_training=True, adapter_dir=adapter_dir)
+
+    # deterministic train/val split (val is held out for best-checkpoint selection)
+    rows = list(rows)
+    random.Random(cfg.seed).shuffle(rows)
+    n_val = min(300, max(0, int(len(rows) * cfg.val_fraction)))
+    val_rows, train_rows = rows[:n_val], rows[n_val:]
+    log(f"stage={stage}: train={len(train_rows)} val={len(val_rows)}")
+
     params = model.trainable_parameters()
     lr = cfg.stage_lr.get(stage, 1e-4)
-    opt = PagedAdamW8bit(params, lr=lr, weight_decay=0.0)
+    opt = PagedAdamW8bit(params, lr=lr, weight_decay=cfg.weight_decay)
 
-    start_step, start_epoch = 0, 0
+    micro, ga = cfg.micro_batch, cfg.grad_accum
+    epochs = cfg.stage_epochs.get(stage, 1)
+    steps_per_epoch = max(1, math.ceil(len(train_rows) / (micro * ga)))
+    total_steps = steps_per_epoch * epochs
+    warmup_steps = max(1, int(total_steps * cfg.warmup_ratio))
+    sched = get_scheduler(cfg.lr_scheduler, optimizer=opt,
+                          num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+    log(f"stage={stage}: {total_steps} planned opt-steps ({epochs} ep x {steps_per_epoch}), "
+        f"warmup={warmup_steps}, sched={cfg.lr_scheduler}, wd={cfg.weight_decay}, "
+        f"lora_r={cfg.lora_r}, kd={'seq-level' if stage == 'distill' else 'no'}")
+
+    start_step, start_epoch, best_val, no_improve = 0, 0, float("inf"), 0
     if resume and have_ckpt and state_path.exists():
         st = read_json(state_path, {})
-        start_step = st.get("global_step", 0)
-        start_epoch = st.get("epoch", 0)
-        op = Path(ckpt_dir) / "optimizer.pt"
-        if op.exists():
-            try:
-                # weights_only=False: bnb 8-bit optimizer state holds non-tensor objects
-                opt.load_state_dict(torch.load(op, map_location=model.device,
-                                               weights_only=False))
-                log(f"Resumed optimizer + step {start_step}.")
-            except Exception as e:
-                log(f"optimizer resume failed ({e}); continuing with fresh optimizer.", err=True)
+        start_step = st.get("global_step", 0); start_epoch = st.get("epoch", 0)
+        best_val = st.get("best_val", float("inf")); no_improve = st.get("no_improve", 0)
+        for name, obj, wo in (("optimizer.pt", opt, False), ("scheduler.pt", sched, False)):
+            fp = Path(ckpt_dir) / name
+            if fp.exists():
+                try:
+                    obj.load_state_dict(torch.load(fp, map_location=model.device, weights_only=wo))
+                except Exception as e:
+                    log(f"  {name} resume failed ({e}); continuing.", err=True)
+        log(f"Resumed @ step {start_step} (best_val={best_val:.4f}, no_improve={no_improve}).")
 
-    epochs = cfg.stage_epochs.get(stage, 1)
-    micro = cfg.micro_batch
-    ga = cfg.grad_accum
+    def _run_val():
+        model.llm.eval()
+        losses = []
+        with torch.no_grad():
+            for r in val_rows[:200]:
+                tgt = r.get("target")
+                if not tgt:
+                    continue
+                try:
+                    losses.append(float(model.forward_batch(
+                        [(_load_wav(r.get("audio")),
+                          r.get("prompt") or r.get("instruction_text") or "", tgt)])))
+                except Exception:
+                    pass
+        model.llm.train()
+        return sum(losses) / len(losses) if losses else float("nan")
+
     global_step = start_step
-    micro_count = 0                       # counts ACTUAL backward() calls (not loop index)
     t0 = time.time()
+    stop = False
 
     for epoch in range(start_epoch, epochs):
-        random.Random(cfg.seed + epoch).shuffle(rows)
+        order = list(range(len(train_rows)))
+        random.Random(cfg.seed + epoch).shuffle(order)
+        if cfg.length_bucket:   # sort within megabatches by target length -> less padding
+            mb = micro * ga * 32
+            order = [j for i in range(0, len(order), mb)
+                     for j in sorted(order[i:i + mb],
+                                     key=lambda j: len(train_rows[j].get("target", "")))]
         opt.zero_grad(set_to_none=True)
-        micro_count = 0                   # reset per epoch (partial window flushed below)
-        pending = False
-        for bi in range(0, len(rows), micro):
-            batch_rows = rows[bi:bi + micro]
-            batch = [(_load_wav(r.get("audio")),
-                      r.get("prompt") or r.get("instruction_text") or "",
-                      r["target"]) for r in batch_rows]
+        micro_count, pending, last_loss = 0, False, float("nan")
+        for bi in range(0, len(order), micro):
+            batch = [(_load_wav(train_rows[j].get("audio")),
+                      train_rows[j].get("prompt") or train_rows[j].get("instruction_text") or "",
+                      train_rows[j]["target"]) for j in order[bi:bi + micro]]
             batch = [b for b in batch if b[2]]
             if not batch:
                 continue
-            loss = model.forward_batch(batch) / ga
+            try:
+                loss = model.forward_batch(batch) / ga
+            except Exception as e:
+                if classify_error(e) in ("oom", "nvml"):
+                    raise                                   # let the supervisor handle it
+                log(f"  batch skipped ({e}).", err=True)
+                continue
             loss.backward()
-            pending = True
-            micro_count += 1
-            if micro_count % ga == 0:                       # true accumulation boundary
+            last_loss = loss.item() * ga
+            pending = True; micro_count += 1
+            if micro_count % ga == 0:
                 torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
-                opt.step()
-                opt.zero_grad(set_to_none=True)
-                pending = False
-                global_step += 1
+                opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
+                pending = False; global_step += 1
+                cur_lr = sched.get_last_lr()[0]
                 if global_step % cfg.log_steps == 0:
                     used, total = gpu_mem_gb()
-                    sps = global_step / max(1e-6, time.time() - t0)
-                    log(f"stage={stage} ep={epoch} step={global_step} "
-                        f"loss={loss.item() * ga:.4f} lr={lr:g} "
-                        f"vram={used}/{total}GB {sps:.2f} step/s")
+                    its = (global_step - start_step) / max(1e-6, time.time() - t0)
+                    log(f"stage={stage} ep={epoch} step={global_step}/{total_steps} "
+                        f"loss={last_loss:.4f} lr={cur_lr:.2e} vram={used}/{total}GB {its:.2f} it/s")
+                    append_jsonl(metrics_path, {"step": global_step, "epoch": epoch,
+                                                "loss": last_loss, "lr": cur_lr, "t": time.time()})
                 if global_step % cfg.save_steps == 0:
-                    _save_ckpt(model, opt, ckpt_dir, global_step, epoch)
-        if pending:                                         # flush the final partial window
+                    _save_ckpt(model, opt, sched, ckpt_dir, global_step, epoch, best_val, no_improve)
+                if cfg.eval_steps > 0 and val_rows and global_step % cfg.eval_steps == 0:
+                    vl = _run_val()
+                    append_jsonl(metrics_path, {"step": global_step, "val_loss": vl})
+                    log(f"  [val] step={global_step} val_loss={vl:.4f} (best={best_val:.4f})")
+                    if vl == vl and vl < best_val - cfg.min_delta:      # vl==vl filters NaN
+                        best_val, no_improve = vl, 0
+                        model.save_adapters(best_dir)
+                        log(f"  [val] new BEST val_loss={best_val:.4f} -> {best_dir}")
+                    else:
+                        no_improve += 1
+                        if no_improve >= cfg.patience:
+                            log(f"  [early-stop] no val improvement for {no_improve} evals.", err=True)
+                            stop = True
+                if stop:
+                    break
+        if pending and not stop:
             torch.nn.utils.clip_grad_norm_(params, cfg.max_grad_norm)
-            opt.step()
-            opt.zero_grad(set_to_none=True)
-            global_step += 1
-        _save_ckpt(model, opt, ckpt_dir, global_step, epoch + 1)
-    _save_ckpt(model, opt, ckpt_dir, global_step, epochs)
-    log(f"Training finished: {global_step} optimizer steps in {time.time() - t0:.0f}s.")
+            opt.step(); sched.step(); opt.zero_grad(set_to_none=True); global_step += 1
+        _save_ckpt(model, opt, sched, ckpt_dir, global_step, epoch + 1, best_val, no_improve)
+        if stop:
+            break
+    _save_ckpt(model, opt, sched, ckpt_dir, global_step, epochs, best_val, no_improve)
+    # promote the best-val checkpoint to the stage checkpoint (so the next stage /
+    # eval init from the best, not the last, weights)
+    if Path(best_dir, "projector.pt").exists() and best_val < float("inf"):
+        log(f"  promoting BEST (val_loss={best_val:.4f}) to the stage checkpoint.")
+        _promote_best(best_dir, ckpt_dir)
+    log(f"Training finished: {global_step} steps in {time.time() - t0:.0f}s. best_val={best_val:.4f}")
 
 
-def _save_ckpt(model, opt, ckpt_dir, step, epoch):
+def _save_ckpt(model, opt, sched, ckpt_dir, step, epoch, best_val, no_improve):
     import torch
     model.save_adapters(ckpt_dir)
     torch.save(opt.state_dict(), str(Path(ckpt_dir) / "optimizer.pt"))
+    try:
+        torch.save(sched.state_dict(), str(Path(ckpt_dir) / "scheduler.pt"))
+    except Exception:
+        pass
     write_json(Path(ckpt_dir) / "trainer_state.json",
-               {"global_step": step, "epoch": epoch, "time": time.time()})
+               {"global_step": step, "epoch": epoch, "best_val": best_val,
+                "no_improve": no_improve, "time": time.time()})
     log(f"  checkpoint saved @ step {step} -> {ckpt_dir}")
+
+
+def _promote_best(best_dir, ckpt_dir):
+    """Copy the best-val adapters over the stage checkpoint (kept in best/)."""
+    import shutil
+    bp, bl = Path(best_dir) / "projector.pt", Path(best_dir) / "lora"
+    try:
+        if bp.exists():
+            shutil.copy2(bp, Path(ckpt_dir) / "projector.pt")
+        if bl.exists():
+            dst = Path(ckpt_dir) / "lora"
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(bl, dst)
+    except Exception as e:
+        log(f"  best-promote failed ({e}); keeping last checkpoint.", err=True)
 
 
 def _load_wav(path):
@@ -2167,25 +2396,29 @@ def cmd_eval(args):
     CFG.ensure_dirs()
     set_seed(CFG.seed)
     suite = args.suite
-    log(f"=== EVAL suite={suite} ===")
+    limit = getattr(args, "limit", None) or CFG.bench_limit     # preset-scaled by default
+    log(f"=== EVAL suite={suite} limit={limit} preset={CFG.preset} ===")
     results = read_json(Path(CFG.bench_dir) / "results.json", {}) or {}
 
     if suite in ("asr", "all"):
-        results["asr"] = eval_asr(CFG, limit=args.limit); _free_gpu()
+        results["asr"] = eval_asr(CFG, limit=limit); _free_gpu()
     if suite in ("tts", "all"):
-        results["tts"] = eval_tts(CFG, limit=args.limit); _free_gpu()
+        results["tts"] = eval_tts(CFG, limit=max(50, limit // 2)); _free_gpu()
     if suite in ("s2s", "all"):
-        results["s2s"] = eval_s2s(CFG, limit=args.limit); _free_gpu()
+        results["s2s"] = eval_s2s(CFG, limit=max(40, limit // 4)); _free_gpu()
     if suite in ("medical", "all"):
-        results["medical"] = eval_medical(CFG, limit=args.limit); _free_gpu()
+        results["medical"] = eval_medical(CFG, limit=max(40, limit // 4)); _free_gpu()
     if suite in ("latency", "all"):
         results["latency"] = eval_latency(CFG); _free_gpu()
 
     results["_meta"] = {"time": time.time(), "student": CFG.student_llm,
+                        "preset": CFG.preset, "limit": limit,
                         "ckpt": CFG.stage_ckpt("medical")}
     write_json(Path(CFG.bench_dir) / "results.json", results)
+    _write_report(results)
     _print_report(results)
-    log(f"=== EVAL DONE ===  full JSON: {Path(CFG.bench_dir) / 'results.json'}")
+    log(f"=== EVAL DONE ===  JSON: {Path(CFG.bench_dir) / 'results.json'}  "
+        f"report: {Path(CFG.bench_dir) / 'bench_report.md'}")
 
 
 def _free_gpu():
@@ -2200,7 +2433,7 @@ def _free_gpu():
         pass
 
 
-def _wer_cer(refs, hyps):
+def _wer_cer(refs, hyps, ci=False):
     import jiwer
     refs_n = [normalize_tr(r) for r in refs]
     hyps_n = [normalize_tr(h) for h in hyps]
@@ -2208,8 +2441,78 @@ def _wer_cer(refs, hyps):
     if not pairs:
         return {"wer": None, "cer": None, "n": 0}
     R, H = zip(*pairs)
-    return {"wer": round(jiwer.wer(list(R), list(H)), 4),
-            "cer": round(jiwer.cer(list(R), list(H)), 4), "n": len(pairs)}
+    out = {"wer": round(jiwer.wer(list(R), list(H)), 4),
+           "cer": round(jiwer.cer(list(R), list(H)), 4), "n": len(pairs)}
+    if ci:
+        c = _bootstrap_wer_ci(list(R), list(H))
+        if c:
+            out["wer_ci95"] = c
+    return out
+
+
+def _bootstrap_wer_ci(refs, hyps, alpha=0.05):
+    """95% bootstrap CI for WER. Precomputes per-utterance (errors, ref_len) once,
+    then resamples sums — so it's O(n_resamples) not O(n_resamples * jiwer)."""
+    import jiwer
+    import random as _r
+    comps = []
+    for r, h in zip(refs, hyps):
+        try:
+            o = jiwer.process_words([r], [h])
+            err = o.substitutions + o.deletions + o.insertions
+            nref = o.hits + o.substitutions + o.deletions
+            comps.append((err, max(1, nref)))
+        except Exception:
+            pass
+    if len(comps) < 5:
+        return None
+    n_boot = max(100, int(CFG.bench_bootstrap))
+    rng = _r.Random(1234)
+    wers = []
+    m = len(comps)
+    for _ in range(n_boot):
+        se = sn = 0
+        for _ in range(m):
+            e, nn = comps[rng.randrange(m)]
+            se += e; sn += nn
+        wers.append(se / max(1, sn))
+    wers.sort()
+    lo = wers[int(alpha / 2 * len(wers))]
+    hi = wers[min(len(wers) - 1, int((1 - alpha / 2) * len(wers)))]
+    return [round(lo, 4), round(hi, 4)]
+
+
+def _write_report(results):
+    """Write a human-readable markdown benchmark report next to results.json."""
+    meta = results.get("_meta", {})
+    lines = ["# Turkish Native Voice Benchmark",
+             "",
+             f"- preset: **{meta.get('preset')}**  |  items/eval: {meta.get('limit')}  "
+             f"|  student: `{meta.get('student')}`",
+             "- All metrics computed locally/offline. Research/education only — not a clinical tool.",
+             ""]
+    asr = results.get("asr")
+    if isinstance(asr, dict) and asr and "error" not in asr:
+        lines += ["## ASR understanding (WER/CER, Turkish-normalized)", "",
+                  "| model | WER | CER | WER 95% CI | n |", "|---|---|---|---|---|"]
+        for name, d in asr.items():
+            if not isinstance(d, dict):
+                continue
+            ci = d.get("wer_ci95")
+            ci_s = f"[{ci[0]}, {ci[1]}]" if ci else "-"
+            lines.append(f"| {name} | {d.get('wer')} | {d.get('cer')} | {ci_s} | {d.get('n')} |")
+        lines.append("")
+    for suite in ("tts", "s2s", "medical", "latency"):
+        d = results.get(suite)
+        if d is None:
+            continue
+        lines += [f"## {suite.upper()}", "", "```json",
+                  json.dumps(d, ensure_ascii=False, indent=2), "```", ""]
+    try:
+        Path(CFG.bench_dir).mkdir(parents=True, exist_ok=True)
+        (Path(CFG.bench_dir) / "bench_report.md").write_text("\n".join(lines), encoding="utf-8")
+    except Exception as e:
+        log(f"  report write failed ({e}).", err=True)
 
 
 def eval_asr(cfg, limit=200):
@@ -2232,15 +2535,42 @@ def eval_asr(cfg, limit=200):
         try:
             asr = ASRBackend(mid, cfg)
             hyps = [asr.transcribe(w, 16000, "tr") for w in wavs]
-            out[name] = _wer_cer(refs, hyps)
-            log(f"    {name}: WER={out[name]['wer']} CER={out[name]['cer']} (n={out[name]['n']})")
+            out[name] = _wer_cer(refs, hyps, ci=True)     # + bootstrap 95% CI
+            log(f"    {name}: WER={out[name]['wer']} CER={out[name]['cer']} "
+                f"CI={out[name].get('wer_ci95')} (n={out[name]['n']})")
         except Exception as e:
             out[name] = {"error": str(e)}
             log(f"    {name}: FAILED {e}", err=True)
         finally:
             del asr           # free each Whisper pipeline before loading the next
             _free_gpu()
+    # secondary domain-shift eval set (MediaSpeech) for our model only
+    try:
+        m_refs, m_wavs = _load_mediaspeech_tr(cfg, max(40, limit // 2))
+        if m_refs:
+            asr = ASRBackend(cfg.whisper_ckpt, cfg)
+            hyps = [asr.transcribe(w, 16000, "tr") for w in m_wavs]
+            out["whisper-ft2 (ours) @ MediaSpeech"] = _wer_cer(m_refs, hyps, ci=True)
+            del asr; _free_gpu()
+    except Exception as e:
+        log(f"  MediaSpeech eval skipped ({e}).", err=True)
     return out
+
+
+def _load_mediaspeech_tr(cfg, limit):
+    ds = _hf_load(cfg.mediaspeech_repo, "tr", "test", streaming=True, audio_col="audio")
+    refs, wavs = [], []
+    for ex in ds:
+        low = {str(k).lower(): v for k, v in ex.items()}
+        txt = str(low.get("transcription") or low.get("sentence") or low.get("text") or "")
+        af = low.get("audio")
+        if not txt or af is None:
+            continue
+        arr, sr = _decode_audio_field(af)
+        refs.append(txt); wavs.append(_to16k(arr, sr))
+        if len(refs) >= limit:
+            break
+    return refs, wavs
 
 
 def eval_tts(cfg, limit=100):
@@ -2261,12 +2591,60 @@ def eval_tts(cfg, limit=100):
             refs.append(s); wavs.append((wav, sr))
         except Exception as e:
             log(f"    synth/asr failed: {e}", err=True)
-    res = {"round_trip": _wer_cer(refs, hyps)}
-    res["mos_utmos"] = _mos_score([w for w, _ in wavs], [sr for _, sr in wavs])
-    res["speaker_sim"] = _speaker_sim(cfg, [w for w, _ in wavs], [sr for _, sr in wavs])
-    log(f"    round-trip WER={res['round_trip']['wer']}  MOS={res['mos_utmos']}  "
-        f"spk_sim={res['speaker_sim']}")
+    W = [w for w, _ in wavs]
+    S = [sr for _, sr in wavs]
+    res = {"round_trip": _wer_cer(refs, hyps, ci=True),
+           "mos_utmos": _mos_score(W, S),
+           "mos_nisqa": _nisqa_score(W, S),
+           "speaker_sim_ecapa": _speaker_sim(cfg, W, S),
+           "prosody": _prosody_stats(W, S),
+           "n": len(W)}
+    log(f"    round-trip WER={res['round_trip'].get('wer')}  UTMOS={res['mos_utmos']}  "
+        f"NISQA={res['mos_nisqa']}  spk_sim={res['speaker_sim_ecapa']}")
     return res
+
+
+def _nisqa_score(wavs, srs):
+    """Reference-free naturalness MOS via NISQA if available, else skipped."""
+    try:
+        from nisqa.NISQA_model import nisqaModel   # optional
+    except Exception:
+        try:
+            import torchaudio
+            bundle = torchaudio.pipelines.SQUIM_SUBJECTIVE  # torchaudio's MOS estimator
+            import torch
+            model = bundle.get_model()
+            vals = []
+            for w, sr in zip(wavs, srs):
+                x = torch.tensor(_to16k(w, sr)).unsqueeze(0)
+                vals.append(float(model(x, x)))     # non-matching-reference MOS
+            return round(sum(vals) / len(vals), 3) if vals else None
+        except Exception as e:
+            return {"error": f"no NISQA/SQUIM ({e})"}
+    return {"note": "nisqa present; run its CLI for full metrics"}
+
+
+def _prosody_stats(wavs, srs):
+    """F0 (pitch) mean/std and speaking-rate proxies over the synthesized set."""
+    try:
+        import numpy as np
+        import librosa
+        f0m, f0s, rms = [], [], []
+        for w, sr in zip(wavs, srs):
+            y = _to16k(w, sr)
+            try:
+                f0, vflag, _ = librosa.pyin(y, fmin=65, fmax=400, sr=16000)
+                f0 = f0[~np.isnan(f0)] if f0 is not None else np.array([])
+                if f0.size:
+                    f0m.append(float(np.mean(f0))); f0s.append(float(np.std(f0)))
+            except Exception:
+                pass
+            rms.append(float(np.mean(librosa.feature.rms(y=y))))
+        return {"f0_mean_hz": round(float(np.mean(f0m)), 1) if f0m else None,
+                "f0_std_hz": round(float(np.mean(f0s)), 1) if f0s else None,
+                "rms_energy": round(float(np.mean(rms)), 4) if rms else None}
+    except Exception as e:
+        return {"error": f"prosody unavailable ({e})"}
 
 
 def eval_s2s(cfg, limit=100):
@@ -2853,6 +3231,8 @@ def main():
         prog="turkish_medvoice.py",
         description="Native Turkish medical speech-to-speech: setup/data/train/eval/serve/doctor/auto")
     p.add_argument("--config", help="optional YAML overriding CONFIG fields")
+    p.add_argument("--preset", choices=["smoke", "standard", "hardcore"], default=None,
+                   help="scale everything: smoke (fast test) | standard | hardcore (research)")
     p.add_argument("--no-heal", action="store_true",
                    help="disable the top-level self-healing supervisor (raise on error)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2882,7 +3262,8 @@ def main():
     e = sub.add_parser("eval", help="run the Turkish voice benchmark")
     e.add_argument("--suite", choices=["asr", "tts", "s2s", "medical", "latency", "all"],
                    default="all")
-    e.add_argument("--limit", type=int, default=200)
+    e.add_argument("--limit", type=int, default=None,
+                   help="items per eval (default: the preset's bench_limit)")
     e.add_argument("--baselines", nargs="*", default=[],
                    help="extra baselines to include, e.g. mms xtts qwen-omni")
     e.set_defaults(func=cmd_eval)
@@ -2903,6 +3284,9 @@ def main():
     args = p.parse_args()
     if args.config:
         _apply_yaml(args.config)
+    # preset (CLI > TMV_PRESET env > config default), then explicit env vars win
+    preset = args.preset or os.environ.get("TMV_PRESET") or CFG.preset
+    _apply_preset(CFG, preset)
     _apply_heal_level(CFG, HEAL_LEVEL)          # emergency-degradation ladder (env-persisted)
     if getattr(args, "baselines", None):
         globals()["_ACTIVE_BASELINES"] = args.baselines
