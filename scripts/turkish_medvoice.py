@@ -619,10 +619,40 @@ def supervise(exc, args):
 
 
 def _proactive_env():
-    """Set environment that pre-empts the most common MIG/tokenizer failures."""
+    """Set environment that pre-empts the most common MIG/tokenizer/hang failures."""
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # MIG NVML
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    # so a stalled HF download raises (and self-heals) instead of hanging forever
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
+
+
+def _call_with_timeout(fn, timeout, *args, **kwargs):
+    """Run fn(*args) but abort with TimeoutError after `timeout` seconds so a
+    single hung call (e.g. a stuck TTS synthesis) can't freeze the whole run.
+    Uses SIGALRM (Unix, main thread only)."""
+    import signal
+    if timeout <= 0 or not hasattr(signal, "SIGALRM"):
+        return fn(*args, **kwargs)
+
+    def _handler(signum, frame):
+        raise TimeoutError(f"call exceeded {timeout}s")
+
+    old = signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, timeout)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def _synth(tts, text, out_path=None):
+    """TTS synth with a hard per-utterance timeout so one hung clip can't freeze
+    the whole data build (tune with TMV_SYNTH_TIMEOUT seconds)."""
+    to = int(os.environ.get("TMV_SYNTH_TIMEOUT", "90"))
+    return _call_with_timeout(tts.synth, to, text, out_path=out_path)
 
 
 # =========================================================================== #
@@ -1483,7 +1513,7 @@ def _build_s2s_manifest(cfg):
         if tts.available():
             try:
                 wav_path = str(audio_root / f"s2s_{written:07d}.wav")
-                tts.synth(instr[:600], out_path=wav_path)
+                _synth(tts, instr[:600], wav_path)
                 row["audio"] = wav_path
             except Exception as e:
                 log(f"  synth failed at {written}: {e}", err=True)
@@ -1533,7 +1563,7 @@ def _build_medical_triples(cfg, gaz, n, use_teacher=False):
             try:
                 spoken = apply_pronunciation(q[:600], gaz)
                 wav_path = str(audio_root / f"med_{written:07d}.wav")
-                tts.synth(spoken, out_path=wav_path)
+                _synth(tts, spoken, wav_path)
                 row["audio"] = wav_path
             except Exception as e:
                 log(f"  synth failed at {written}: {e}", err=True)
@@ -1576,7 +1606,7 @@ def _teacher_augment_medical(cfg, gaz, man, tts, audio_root, start, target):
             if tts.available():
                 spoken = apply_pronunciation(q[:600], gaz)
                 wav_path = str(audio_root / f"medT_{written:07d}.wav")
-                tts.synth(spoken, out_path=wav_path)
+                _synth(tts, spoken, wav_path)
                 row["audio"] = wav_path
             append_jsonl(man, row)
             written += 1
@@ -2225,7 +2255,7 @@ def eval_tts(cfg, limit=100):
     hyps, refs, wavs = [], [], []
     for s in sentences:
         try:
-            wav, sr = tts.synth(s)
+            wav, sr = _synth(tts, s)
             wav16 = _to16k(wav, sr)
             hyps.append(asr.transcribe(wav16, 16000, "tr"))
             refs.append(s); wavs.append((wav, sr))
@@ -2419,7 +2449,7 @@ def _spoken_qa_set(cfg, limit):
     pairs = pairs[:limit]
     items = []
     for q, a in pairs:
-        wav, sr = tts.synth(q)
+        wav, sr = _synth(tts, q)
         items.append({"wav": _to16k(wav, sr), "answer": a, "prompt": ""})
     log(f"    spoken-QA: {len(items)} UNIQUE items "
         f"({'curated+MedTurkQuAD' if len(items) > len(qa) else 'curated only'}).")
@@ -2452,7 +2482,7 @@ def _medical_eval_set(cfg, limit):
     items = items[:limit]
     out = []
     for it in items:
-        wav, sr = tts.synth(it["q"])
+        wav, sr = _synth(tts, it["q"])
         out.append({"wav": _to16k(wav, sr), "expected_terms": it["terms"], "prompt": ""})
     log(f"    medical-term eval: {len(out)} UNIQUE probes.")
     return out
