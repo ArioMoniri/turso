@@ -27,6 +27,7 @@ WORK=${WORK:-/data/medvoice}                 # our outputs
 VENV=${VENV:-/data/venv-medvoice}            # training venv (torch 2.8.0+cu128)
 OMNI_VENV=${OMNI_VENV:-/data/venv-omni}      # TTS venv — MUST stay separate (see below)
 PORT_TTS=${PORT_TTS:-8133}
+TTS_WAIT=${TTS_WAIT:-300}                     # seconds to wait for the TTS server
 PRESET=${PRESET:-standard}
 RAW_URL=${RAW_URL:-https://raw.githubusercontent.com/ArioMoniri/turso/main/scripts/turkish_medvoice.py}
 MARKER_NAME=.medvoice-workspace
@@ -376,12 +377,21 @@ start_tts() {
   nohup "$OMNI_PY" -m uvicorn omnivoice_server:app --app-dir "$APP_DIR" \
         --host 127.0.0.1 --port "$PORT_TTS" >>"$WORK/logs/tts_server.log" 2>&1 &
   echo $! >"$TTS_PID_FILE"
-  local i
-  for i in $(seq 1 40); do
-    sleep 3
-    if tts_up; then say "TTS is up (pid $(cat "$TTS_PID_FILE"))."; return 0; fi
+  # Watch the PROCESS as well as the port: a server that crashed on import should
+  # report its traceback at once, not after the full timeout with no explanation.
+  local waited=0 pid
+  pid=$(cat "$TTS_PID_FILE" 2>/dev/null || echo "")
+  while [ "$waited" -lt "$TTS_WAIT" ]; do
+    sleep 3; waited=$((waited + 3))
+    if tts_up; then say "TTS is up after ${waited}s (pid $pid)."; return 0; fi
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      warn "TTS process died after ${waited}s. Tail of $WORK/logs/tts_server.log:"
+      tail -15 "$WORK/logs/tts_server.log" >&2 2>/dev/null || true
+      warn "  data would be built TEXT-ONLY and the run will stop at the speech gate."
+      return 0
+    fi
   done
-  warn "TTS did not come up in 120s — see $WORK/logs/tts_server.log"
+  warn "TTS did not come up in ${TTS_WAIT}s — see $WORK/logs/tts_server.log"
   warn "  data would be built TEXT-ONLY and the run will stop at the speech gate."
   return 0
 }
