@@ -1038,13 +1038,28 @@ def cmd_setup(args):
                 log(f"  optional '{pkg}' failed to install: {e}", err=True)
         # 2f) re-enforce torch in case a dependency still swapped it out
         _ensure_correct_torch(py)
-        # flash-attn is an OPTIONAL speed-up: it needs the CUDA toolkit (nvcc) to
-        # build, which containers often lack. Failure is fine — the model falls
-        # back to attn_implementation='sdpa' automatically.
-        try:
-            _pip(py, ["flash-attn>=2.7.0", "--no-build-isolation"], constraints=cons)
-        except Exception as e:
-            log(f"  flash-attn not built ({str(e)[:80]}...) -> using 'sdpa' (fine).", err=True)
+        # flash-attn is an OPTIONAL speed-up that COMPILES a CUDA extension, so it
+        # needs a full CUDA toolkit (nvcc/CUDA_HOME) — torch ships only the runtime,
+        # so containers almost never have one. Attempting it there just prints a long
+        # build traceback that looks like a fatal error but isn't. Probe first and
+        # skip quietly; PyTorch SDPA already uses flash/mem-efficient kernels.
+        # Force with TMV_FLASH_ATTN=1, skip entirely with TMV_FLASH_ATTN=0.
+        want_flash = os.environ.get("TMV_FLASH_ATTN", "auto").lower()
+        cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+        has_nvcc = bool(shutil.which("nvcc")) or bool(
+            cuda_home and Path(cuda_home, "bin", "nvcc").exists())
+        if want_flash == "0":
+            log("  flash-attn: skipped (TMV_FLASH_ATTN=0) -> using 'sdpa'.")
+        elif want_flash != "1" and not has_nvcc:
+            log("  flash-attn: no CUDA toolkit (nvcc/CUDA_HOME) -> skipping the build; "
+                "using 'sdpa'. This is EXPECTED and not an error. "
+                "Set TMV_FLASH_ATTN=1 to try anyway.")
+        else:
+            try:
+                _pip(py, ["flash-attn>=2.7.0", "--no-build-isolation"], constraints=cons)
+                log("  flash-attn installed.")
+            except Exception as e:
+                log(f"  flash-attn not built ({str(e)[:80]}...) -> using 'sdpa' (fine).", err=True)
 
     # 3) HF auth check (only if requested / interactive)
     if py == sys.executable:
