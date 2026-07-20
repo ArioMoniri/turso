@@ -24,7 +24,8 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------- 0. settings
 SES=${SES:-/data/ses_models}                 # your model assets
 WORK=${WORK:-/data/medvoice}                 # our outputs
-VENV=${VENV:-/data/venv-medvoice}            # python venv
+VENV=${VENV:-/data/venv-medvoice}            # training venv (torch 2.8.0+cu128)
+OMNI_VENV=${OMNI_VENV:-/data/venv-omni}      # TTS venv — MUST stay separate (see below)
 PORT_TTS=${PORT_TTS:-8133}
 PRESET=${PRESET:-standard}
 RAW_URL=${RAW_URL:-https://raw.githubusercontent.com/ArioMoniri/turso/main/scripts/turkish_medvoice.py}
@@ -64,16 +65,17 @@ die()  { printf '\033[1;31m[wizard] FATAL:\033[0m %s\n' "$*" >&2; exit 1; }
 # adopted automatically; anything else non-empty aborts.
 validate_paths() {
   local p
-  for p in WORK VENV; do
+  for p in WORK VENV OMNI_VENV; do
     [[ -n "${!p:-}" ]]  || die "$p is empty."
     [[ "${!p}" = /* ]]  || die "$p must be an absolute path (got '${!p}')."
   done
   # resolve symlinks so a symlinked WORK cannot redirect rm -rf into another project
   WORK=$(readlink -f "$WORK" 2>/dev/null || echo "$WORK")
   VENV=$(readlink -f "$VENV" 2>/dev/null || echo "$VENV")
+  OMNI_VENV=$(readlink -f "$OMNI_VENV" 2>/dev/null || echo "$OMNI_VENV")
   SES=$(readlink -f "$SES"  2>/dev/null || echo "$SES")
 
-  for p in "$WORK" "$VENV"; do
+  for p in "$WORK" "$VENV" "$OMNI_VENV"; do
     case "${p%/}" in
       ""|"/"|"/data"|"/root"|"/home"|"/usr"|"/etc"|"/var"|"/opt"|"/srv"|"/mnt"|"/tmp"|"/boot")
         die "refusing to use '$p' — that is a system/mount root, not a workspace." ;;
@@ -84,6 +86,7 @@ validate_paths() {
   [[ "${WORK%/}" != "${SES%/}" ]] || die "WORK == SES ('$WORK') — that would delete your model assets."
   case "${WORK%/}" in "${SES%/}"/*) die "WORK ('$WORK') is inside SES — cleaning would hit your assets." ;; esac
   case "${VENV%/}" in "${WORK%/}"/*) die "VENV ('$VENV') is inside WORK — cleaning would delete your venv." ;; esac
+  case "${OMNI_VENV%/}" in "${WORK%/}"/*) die "OMNI_VENV ('$OMNI_VENV') is inside WORK — cleaning would delete it." ;; esac
 
   # IDENTITY GATE: only ever clean a directory this wizard created or adopted.
   local marker="${WORK%/}/$MARKER_NAME"
@@ -195,6 +198,38 @@ ensure_venv() {
   [[ -x "$PY" ]] || die "venv created but $PY is missing."
   "$PY" -m pip install -q --upgrade pip setuptools wheel 2>/dev/null || warn "pip self-upgrade failed (continuing)."
   say "venv ready: $PY ($("$PY" -V 2>&1))"
+}
+
+# ------------------------------------------------------- 4b. TTS venv (separate)
+# The `omnivoice` package pulls torch 2.13+cu130, which is UNUSABLE on this box's
+# CUDA-12.8 driver and would destroy the training venv's torch 2.8.0+cu128. The
+# asset README is explicit about this ("yeni omnivoice torch 2.13-cu130 ceker,
+# GERI ZORLA!"), which is why TTS gets its own venv and we talk to it over HTTP.
+ensure_omni_venv() {
+  OMNI_PY="$OMNI_VENV/bin/python"
+  if [[ -x "$OMNI_PY" ]] && "$OMNI_PY" -c 'import omnivoice' >/dev/null 2>&1; then
+    say "TTS venv: $OMNI_VENV (omnivoice present)"; return 0
+  fi
+  say "building the separate OmniVoice TTS venv at $OMNI_VENV ..."
+  say "  (kept apart from $VENV because omnivoice would drag torch to cu130)"
+  local base
+  base=$(command -v python3.11 || command -v python3) || die "no python3 to build the TTS venv."
+  if [[ ! -x "$OMNI_PY" ]]; then
+    "$base" -m venv "$OMNI_VENV" >/dev/null 2>&1 || die "cannot create TTS venv at $OMNI_VENV"
+  fi
+  OMNI_PY="$OMNI_VENV/bin/python"
+  "$OMNI_PY" -m pip install -q --upgrade pip wheel >/dev/null 2>&1 || true
+  say "  installing omnivoice + fastapi + uvicorn ..."
+  "$OMNI_PY" -m pip install -q omnivoice fastapi "uvicorn[standard]" \
+    || die "omnivoice install failed in $OMNI_VENV"
+  # README step 3: force torch BACK to cu128 after omnivoice drags in cu130
+  say "  re-pinning torch 2.8.0+cu128 in the TTS venv (omnivoice pulls cu130) ..."
+  "$OMNI_PY" -m pip install -q --force-reinstall torch==2.8.0 torchaudio==2.8.0 \
+      --index-url https://download.pytorch.org/whl/cu128 \
+    || warn "torch re-pin failed in $OMNI_VENV — TTS may not see the GPU."
+  "$OMNI_PY" -c 'import omnivoice, torch; print("  omnivoice ok | torch", torch.__version__, "| cuda", torch.cuda.is_available())' \
+    || die "TTS venv still cannot import omnivoice."
+  say "TTS venv ready: $OMNI_PY"
 }
 
 # ------------------------------------------------------------ 5. asset detect
@@ -338,7 +373,7 @@ start_tts() {
   mkdir -p "$WORK/logs"
   OMNI_MODEL="$OMNI_DIR" OMNI_REF="$REF_WAV" OMNI_REFTXT_FILE="$REF_TXT" OMNI_LANG=tr \
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  nohup "$PY" -m uvicorn omnivoice_server:app --app-dir "$APP_DIR" \
+  nohup "$OMNI_PY" -m uvicorn omnivoice_server:app --app-dir "$APP_DIR" \
         --host 127.0.0.1 --port "$PORT_TTS" >>"$WORK/logs/tts_server.log" 2>&1 &
   echo $! >"$TTS_PID_FILE"
   local i
@@ -357,6 +392,7 @@ say "=== turkish-medvoice run wizard ==="
 
 validate_paths
 ensure_venv
+ensure_omni_venv
 clean_previous
 mkdir -p "$WORK/logs"
 detect_assets
@@ -377,7 +413,7 @@ export TMV_ROOT="$SES" TMV_WORK="$WORK" TMV_VENV="$VENV"
 export TMV_WHISPER_CKPT="$WHISPER_DIR"
 export TMV_OMNI_MODEL="$OMNI_DIR" TMV_OMNI_REF="$REF_WAV" TMV_OMNI_REFTXT="$REF_TXT"
 export TMV_TTS_MODE=http TMV_OMNI_URL="http://127.0.0.1:$PORT_TTS/v1/audio/speech"
-export TMV_OMNI_VENV_PY="$PY" TMV_OMNI_APP_DIR="$APP_DIR"
+export TMV_OMNI_VENV_PY="$OMNI_PY" TMV_OMNI_APP_DIR="$APP_DIR"
 export HF_HOME="${HF_HOME:-$WORK/hf_cache}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # VRAM ceilings. These OVERRIDE the preset (env wins in the trainer) — say so out

@@ -964,8 +964,13 @@ PIP_PACKAGES = [
     "fastapi", "uvicorn[standard]", "python-multipart", "requests",
     # eval
     "jiwer>=3.0.4", "torchmetrics[audio]", "speechbrain",
-    # tts (your OmniVoice)
-    "omnivoice",
+    # NOTE: `omnivoice` is deliberately NOT installed here. It pulls torch
+    # 2.13+cu130, which is unusable on a CUDA-12.8 driver and would break this
+    # training venv (the asset README says exactly this: "yeni omnivoice torch
+    # 2.13-cu130 ceker, GERI ZORLA!"). The TTS server therefore lives in its OWN
+    # venv (see run_medvoice.sh: ensure_omni_venv) and we talk to it over HTTP
+    # via TMV_TTS_MODE=http. Set TMV_TTS_MODE=python only in a venv where you
+    # have installed omnivoice yourself and re-pinned torch to 2.8.0+cu128.
 ]
 PIP_OPTIONAL = [
     # resemblyzer pulls in webrtcvad, which COMPILES a C extension (needs
