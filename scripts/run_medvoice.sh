@@ -51,6 +51,26 @@ say()  { printf '\033[1;36m[wizard]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[wizard]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[wizard] FATAL:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# SAFETY: this script rm -rf's paths under $WORK, and $WORK sits on a mount shared
+# with unrelated projects. Refuse any WORK that is empty, relative, a system dir, a
+# bare mount root, or the assets dir — a typo there must never eat someone's work.
+validate_paths() {
+  [[ -n "${WORK:-}" ]] || die "WORK is empty."
+  [[ "$WORK" = /* ]]   || die "WORK must be an absolute path (got '$WORK')."
+  case "${WORK%/}" in
+    ""|"/"|"/data"|"/root"|"/home"|"/usr"|"/etc"|"/var"|"/opt"|"/srv"|"/mnt"|"/tmp")
+      die "refusing to use WORK='$WORK' — that is a system/mount root, not a workspace." ;;
+  esac
+  [[ $(awk -F/ '{c=0; for(i=1;i<=NF;i++) if($i!="") c++; print c}' <<<"${WORK%/}") -ge 2 ]] \
+    || die "WORK='$WORK' is too shallow; use something like /data/medvoice."
+  if [[ -n "${SES:-}" && "${WORK%/}" == "${SES%/}" ]]; then
+    die "WORK and SES are the same path ('$WORK') — that would delete your model assets."
+  fi
+  case "${WORK%/}" in
+    "${SES%/}"/*) die "WORK ('$WORK') is inside SES ('$SES') — cleaning would hit your assets." ;;
+  esac
+}
+
 # ------------------------------------------------------- 1. resource helpers
 disk_pct()     { df -P  "$1" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5+0}'; }
 disk_free_gb() { df -PBG "$1" 2>/dev/null | awk 'NR==2{gsub(/G/,"",$4); print $4+0}'; }
@@ -116,6 +136,38 @@ start_watchdog() {
   WATCHDOG_PID=$!
   say "resource watchdog running (pid $WATCHDOG_PID) -> $logf"
   trap 'kill "$WATCHDOG_PID" 2>/dev/null || true' EXIT
+}
+
+# ---------------------------------------------------------- 2b. venv bootstrap
+# The venv dir may exist but be empty/broken (no bin/python). Falling back to the
+# system interpreter would scatter multi-GB wheels into /usr and break the TTS
+# server, so build a real venv instead.
+ensure_venv() {
+  PY="$VENV/bin/python"
+  if [[ -x "$PY" ]]; then say "venv: $VENV"; return 0; fi
+  if [[ -e "$VENV" && ! -d "$VENV" ]]; then die "$VENV exists but is not a directory."; fi
+
+  local base; base=$(command -v python3) || die "no python3 on PATH to build a venv with."
+  if [[ -d "$VENV" ]]; then
+    local n; n=$(ls -A "$VENV" 2>/dev/null | wc -l | tr -d ' ')
+    warn "no interpreter at $PY — $VENV exists but holds $n entries; repairing it."
+  fi
+  say "creating venv at $VENV (base: $base) ..."
+  if ! "$base" -m venv "$VENV" >/dev/null 2>&1; then
+    warn "python3 -m venv failed — installing python3-venv and retrying ..."
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -qq >/dev/null 2>&1 || true
+      apt-get install -y python3-venv python3-dev >/dev/null 2>&1 || true
+    fi
+    "$base" -m venv "$VENV" >/dev/null 2>&1 || {
+      warn "still failing — recreating from scratch (--clear) ..."
+      "$base" -m venv --clear "$VENV" || die "could not create a venv at $VENV"
+    }
+  fi
+  PY="$VENV/bin/python"
+  [[ -x "$PY" ]] || die "venv created but $PY is missing."
+  "$PY" -m pip install -q --upgrade pip setuptools wheel 2>/dev/null || warn "pip self-upgrade failed (continuing)."
+  say "venv ready: $PY ($("$PY" -V 2>&1))"
 }
 
 # ------------------------------------------------------------ 3. asset detect
@@ -266,9 +318,8 @@ start_tts() {
 say "=== turkish-medvoice run wizard ==="
 [[ $EUID -eq 0 ]] || warn "not root: page-cache drop / apt clean will be skipped."
 
-PY="$VENV/bin/python"
-if [[ ! -x "$PY" ]]; then PY=$(command -v python3) || die "no python3 found"; fi
-say "python: $PY"
+validate_paths
+ensure_venv
 
 mkdir -p "$WORK" "$WORK/logs"
 clean_previous
