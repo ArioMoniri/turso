@@ -2536,7 +2536,9 @@ def build_model(cfg, for_training=True, adapter_dir=None):
                      context="load:feat")
 
     # frozen Whisper encoder (encoder-only)
-    wm = resilient(lambda: WhisperModel.from_pretrained(cfg.whisper_ckpt,
+    # a CTranslate2 export can't be loaded by transformers -> fall back (loudly)
+    wckpt = _hf_whisper_or_fallback(cfg.whisper_ckpt, cfg.whisper_processor)
+    wm = resilient(lambda: WhisperModel.from_pretrained(wckpt,
                                                         torch_dtype=torch.bfloat16),
                    context="load:whisper")
     encoder = wm.get_encoder()
@@ -2730,6 +2732,39 @@ def _build_adapter(cfg, d_llm):
     if kind == "llamaomni2":
         return LlamaOmni2()
     return Conv()
+
+
+def _hf_whisper_or_fallback(path, fallback):
+    """Return a Whisper checkpoint `transformers` can actually load.
+
+    A CTranslate2 / faster-whisper export (model.bin + vocabulary.*) CANNOT be loaded
+    by transformers — WhisperModel.from_pretrained would die with a confusing error
+    deep in the loader. Detect that (and any other non-HF directory) and fall back to
+    the HF model id, LOUDLY: the Turkish fine-tune is what gives the encoder its
+    low-WER Turkish features, so silently using the base model would be a downgrade
+    the user must know about."""
+    p = Path(path)
+    if not p.is_dir():
+        return path                     # HF hub id -> let transformers resolve it
+    has_hf_weights = any((p / n).exists() for n in
+                         ("model.safetensors", "pytorch_model.bin",
+                          "model.safetensors.index.json", "pytorch_model.bin.index.json"))
+    model_type = ""
+    try:
+        model_type = (json.loads((p / "config.json").read_text()) or {}).get("model_type", "")
+    except Exception:
+        pass
+    if has_hf_weights and model_type == "whisper":
+        return path
+    ct2 = (p / "model.bin").exists() and any((p / n).exists() for n in
+                                             ("vocabulary.json", "vocabulary.txt",
+                                              "shared_vocabulary.json"))
+    kind = "a CTranslate2/faster-whisper export" if ct2 else "not an HF transformers Whisper dir"
+    log(f"WARNING: {p} is {kind} — transformers cannot load it as an encoder. Falling back "
+        f"to '{fallback}'. To keep YOUR Turkish fine-tune, point TMV_WHISPER_CKPT at an "
+        f"HF-format export (config.json with model_type=whisper + model.safetensors).",
+        err=True)
+    return fallback
 
 
 def _load_lora_weights(peft_llm, lora_dir):
@@ -3496,7 +3531,8 @@ def eval_asr(cfg, limit=200):
     except Exception as e:
         log(f"  FLEURS load failed: {e}", err=True)
         return {"error": str(e)}
-    models = {"whisper-ft2 (ours)": cfg.whisper_ckpt,
+    models = {"whisper-ft2 (ours)": _hf_whisper_or_fallback(cfg.whisper_ckpt,
+                                                            cfg.whisper_processor),
               "whisper-large-v3 (base)": "openai/whisper-large-v3",
               "whisper-large-v3-turbo (base)": cfg.whisper_processor}
     if args_has_baseline("mms"):
@@ -4349,12 +4385,19 @@ def cmd_doctor(args):
     except Exception:
         pass
     # asset paths
-    for name, pth in (("whisper-ft2", CFG.whisper_ckpt), ("omnivoice-ft1", CFG.omni_model),
+    for name, pth in (("whisper encoder", CFG.whisper_ckpt), ("omnivoice TTS", CFG.omni_model),
                       ("ref wav", CFG.omni_ref_wav)):
         exists = Path(pth).exists()
         log(f"  asset {name}: {pth} -> {'OK' if exists else 'MISSING'}")
         if not exists:
             healthy = False
+    # the whisper dir must be an HF-format encoder, not a CTranslate2 export
+    if Path(CFG.whisper_ckpt).exists():
+        resolved = _hf_whisper_or_fallback(CFG.whisper_ckpt, CFG.whisper_processor)
+        if resolved != CFG.whisper_ckpt:
+            log("  NOTE: the configured Whisper is NOT HF-format; the run will use the "
+                "base encoder above. Training still works, but you lose your Turkish "
+                "fine-tune's encoder quality.", err=True)
     # TTS reachability (+ autostart) and HF auth
     log(f"  TTS reachable/started: {_ensure_tts_server(CFG)}")
     hf_login_if_needed(interactive=False, require=False)
