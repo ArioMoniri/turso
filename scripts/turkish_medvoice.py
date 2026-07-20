@@ -503,10 +503,17 @@ MAX_HEAL_REEXEC = int(_env("TMV_MAX_HEAL", "12"))
 # Degradation ladder level (env-persisted across re-execs).
 HEAL_LEVEL = int(_env("TMV_HEAL_LEVEL", "0"))
 
+# transformers is PINNED, not floored. On 5.x the causal-LM loss for this setup is
+# computed wrongly (verified on-box: identical data/config gives loss ~0.9 on 4.57.6
+# but ~111 on 5.12 — i.e. a SUM over label tokens instead of a mean). That trains a
+# garbage model without ever raising, so a floor like ">=4.57" is unsafe: pip would
+# happily resolve it to 5.x. Override only if you have verified the loss yourself.
+TFM_PIN = _env("TMV_TRANSFORMERS", "4.57.6")
+
 # import-name -> pip spec, for auto-installing a missing dependency on the fly.
 _IMPORT_TO_PKG = {
     "torch": "torch==2.8.0", "torchaudio": "torchaudio==2.8.0",
-    "transformers": "transformers>=4.57.0", "peft": "peft>=0.14",
+    "transformers": f"transformers=={TFM_PIN}", "peft": "peft>=0.14",
     "datasets": "datasets>=2.18", "bitsandbytes": "bitsandbytes>=0.45",
     "accelerate": "accelerate>=0.34", "huggingface_hub": "huggingface_hub>=0.25",
     "safetensors": "safetensors", "librosa": "librosa==0.10.2", "soundfile": "soundfile",
@@ -950,7 +957,7 @@ def hf_login_if_needed(interactive=True, require=False):
 
 PIP_PACKAGES = [
     # core (pure-python / prebuilt wheels only — nothing here needs a C compiler)
-    "transformers>=4.57.0", "accelerate>=0.34", "peft>=0.14", "datasets>=2.18",
+    f"transformers=={TFM_PIN}", "accelerate>=0.34", "peft>=0.14", "datasets>=2.18",
     "bitsandbytes>=0.45", "huggingface_hub>=0.25", "safetensors",
     "librosa==0.10.2", "soundfile", "sentencepiece", "numpy<2.3", "pyyaml",
     # serving
@@ -1075,7 +1082,8 @@ def _write_torch_constraints():
     try:
         CFG.ensure_dirs()
         p = Path(CFG.work) / "pip-constraints.txt"
-        p.write_text(f"torch=={TORCH_PIN}\ntorchaudio=={TORCH_PIN}\n")
+        p.write_text(f"torch=={TORCH_PIN}\ntorchaudio=={TORCH_PIN}\n"
+                     f"transformers=={TFM_PIN}\n")
         return str(p)
     except Exception:
         return None
@@ -2515,6 +2523,10 @@ def build_model(cfg, for_training=True, adapter_dir=None):
             err=True)
         adapter_dir = None
 
+    # a wrong transformers major silently mis-scales the LM loss -> stop before we
+    # burn days of GPU time optimizing the wrong objective
+    check_transformers_version(fatal=for_training)
+
     log("Loading tokenizer + Whisper encoder + Qwen student ...")
     # model/tokenizer downloads auto-retry on hub transience
     tok = resilient(lambda: AutoTokenizer.from_pretrained(cfg.student_llm),
@@ -2732,6 +2744,36 @@ def _build_adapter(cfg, d_llm):
     if kind == "llamaomni2":
         return LlamaOmni2()
     return Conv()
+
+
+def check_transformers_version(fatal=True):
+    """Refuse to train on a transformers major version whose causal-LM loss is wrong.
+
+    Measured on-box: same data + config gives train loss ~0.9 on transformers 4.57.6
+    but ~111 on 5.12 — consistent with the loss being SUMMED over label tokens rather
+    than averaged. Nothing raises; the run just optimizes a mis-scaled objective and
+    silently produces a bad model. Since a full run costs days of H200 time, this is a
+    hard stop rather than a warning. TMV_ALLOW_BAD_TFM=1 overrides."""
+    try:
+        import transformers
+        ver = transformers.__version__
+    except Exception:
+        return None
+    major = 0
+    try:
+        major = int(str(ver).split(".")[0])
+    except Exception:
+        pass
+    if major >= 5 and os.environ.get("TMV_ALLOW_BAD_TFM", "0") != "1":
+        msg = (f"transformers {ver} computes the causal-LM loss incorrectly for this "
+               f"setup (loss ~111 instead of ~0.9) and would silently train a broken "
+               f"model. Install the pinned version:\n"
+               f"    pip install 'transformers=={TFM_PIN}'\n"
+               f"(set TMV_ALLOW_BAD_TFM=1 only if you have verified the loss yourself).")
+        if fatal:
+            die(msg)
+        log("WARNING: " + msg, err=True)
+    return ver
 
 
 def _hf_whisper_or_fallback(path, fallback):
@@ -4368,6 +4410,17 @@ def cmd_doctor(args):
     except Exception as e:
         log(f"  torch missing ({e}) -> auto-installing (a fix, not a hard failure).", err=True)
         _auto_pip_install(_IMPORT_TO_PKG["torch"], "torch")
+    # transformers major must be one whose causal-LM loss is correct (see TFM_PIN)
+    try:
+        import transformers as _tfm
+        _bad = int(str(_tfm.__version__).split(".")[0]) >= 5
+        log(f"  transformers {_tfm.__version__} (pinned {TFM_PIN}) -> "
+            f"{'BAD LOSS — will refuse to train' if _bad else 'OK'}")
+        if _bad:
+            log(f"  fix: pip install 'transformers=={TFM_PIN}'", err=True)
+            healthy = False
+    except Exception:
+        pass
     # core deps — installing a missing one is a FIX, so it does not mark unhealthy
     for mod in ("transformers", "peft", "datasets", "bitsandbytes", "librosa",
                 "soundfile", "jiwer", "huggingface_hub", "fastapi", "requests"):
