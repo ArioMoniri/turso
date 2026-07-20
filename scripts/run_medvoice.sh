@@ -125,6 +125,14 @@ has_hf_weights() {
   return 1
 }
 
+# A usable training encoder must be an HF transformers Whisper dir. A CTranslate2 /
+# faster-whisper export (model.bin + vocabulary.*) looks similar but cannot be loaded.
+is_hf_whisper() {
+  [[ -f "$1/config.json" ]] || return 1
+  has_hf_weights "$1" || return 1
+  grep -q '"model_type"[[:space:]]*:[[:space:]]*"whisper"' "$1/config.json" 2>/dev/null
+}
+
 detect_assets() {
   [[ -d "$SES" ]] || die "assets dir not found: $SES   (export SES=/path/to/ses_models)"
 
@@ -134,14 +142,22 @@ detect_assets() {
 
   # Whisper encoder MUST be HF-format; a *-ct2 (CTranslate2) export cannot be loaded
   # by transformers, so fall back to the base model rather than crash mid-training.
-  WHISPER_DIR=""
-  while read -r d; do
-    [[ -z "$d" ]] && continue
-    if [[ -f "$d/config.json" ]] && has_hf_weights "$d" &&
-       grep -q '"model_type"[[:space:]]*:[[:space:]]*"whisper"' "$d/config.json" 2>/dev/null; then
-      WHISPER_DIR="$d"; break
+  # An explicit WHISPER=/path (or a pre-set TMV_WHISPER_CKPT) always wins.
+  WHISPER_DIR="${WHISPER:-${TMV_WHISPER_CKPT:-}}"
+  if [[ -n "$WHISPER_DIR" ]]; then
+    say "whisper pinned by env -> $WHISPER_DIR"
+    if [[ -d "$WHISPER_DIR" ]] && ! is_hf_whisper "$WHISPER_DIR"; then
+      warn "pinned $WHISPER_DIR is NOT an HF transformers Whisper dir — the trainer will"
+      warn "  fall back to the base model. Unset WHISPER/TMV_WHISPER_CKPT to auto-detect."
     fi
-  done < <(find "$SES" -maxdepth 1 -type d -name 'whisper*' | sort -Vr)
+  else
+    # search *hf* names first, then anything else; format check is the real gate
+    while read -r d; do
+      [[ -z "$d" ]] && continue
+      if is_hf_whisper "$d"; then WHISPER_DIR="$d"; break; fi
+    done < <( { find "$SES" -maxdepth 1 -type d -name 'whisper*hf*';
+                find "$SES" -maxdepth 1 -type d -name 'whisper*' ! -name '*hf*'; } 2>/dev/null )
+  fi
 
   if [[ -z "$WHISPER_DIR" ]]; then
     WHISPER_DIR="openai/whisper-large-v3-turbo"
