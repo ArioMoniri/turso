@@ -2,14 +2,14 @@
 # =============================================================================
 #  turkish-medvoice RUN WIZARD
 #  One command sets up and runs the whole native Turkish voice-to-voice pipeline:
-#    clean previous run -> fetch latest trainer -> detect assets -> size to disk
-#    -> start OmniVoice TTS -> setup -> doctor -> data -> train -> eval
+#    validate -> venv -> clean previous -> fetch trainer -> detect assets
+#    -> size to disk -> start OmniVoice TTS -> setup -> doctor -> data
+#    -> train(align,s2s,medical) -> eval
 #
-#  It NEVER touches: other projects under /data, your venv, tmux sessions, or the
-#  model assets in ses_models. It only removes artifacts THIS project generated.
-#
-#  A background watchdog stops the run BEFORE the box maxes out on disk or RAM,
-#  and the trainer shrinks its sequence length before it can OOM the GPU.
+#  SAFETY MODEL: this script deletes files under $WORK, which lives on a mount
+#  shared with unrelated projects. It will ONLY clean a directory that carries its
+#  own marker (.medvoice-workspace) or is recognisably a medvoice workspace. A
+#  mistyped WORK aborts instead of deleting someone else's project.
 #
 #  Run it inside tmux:
 #    tmux new -s medvoice
@@ -28,52 +28,84 @@ VENV=${VENV:-/data/venv-medvoice}            # python venv
 PORT_TTS=${PORT_TTS:-8133}
 PRESET=${PRESET:-standard}
 RAW_URL=${RAW_URL:-https://raw.githubusercontent.com/ArioMoniri/turso/main/scripts/turkish_medvoice.py}
+MARKER_NAME=.medvoice-workspace
 
 # resource ceilings, percent of capacity. WARN = prune, STOP = halt the run.
 DISK_WARN=${DISK_WARN:-85};  DISK_STOP=${DISK_STOP:-93}
-RAM_WARN=${RAM_WARN:-88};    RAM_STOP=${RAM_STOP:-95}
+RAM_STOP=${RAM_STOP:-95}
 VRAM_WARN=${VRAM_WARN:-92}
 RESERVE_GB=${RESERVE_GB:-30}                 # keep free for models/cache/checkpoints
 
 CLEAN=soft; ASSUME_YES=0; DO_RUN=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --clean)  CLEAN="$2"; shift 2 ;;
-    --preset) PRESET="$2"; shift 2 ;;
+    --clean)
+      [[ $# -ge 2 && "$2" != --* ]] || { echo "--clean needs a value: soft|full|all" >&2; exit 2; }
+      CLEAN="$2"; shift 2 ;;
+    --preset)
+      [[ $# -ge 2 && "$2" != --* ]] || { echo "--preset needs a value: smoke|standard|hardcore" >&2; exit 2; }
+      PRESET="$2"; shift 2 ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --no-run) DO_RUN=0; shift ;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
+case "$CLEAN" in soft|full|all) ;; *) echo "invalid --clean '$CLEAN' (soft|full|all)" >&2; exit 2 ;; esac
+case "$PRESET" in smoke|standard|hardcore) ;; *) echo "invalid --preset '$PRESET' (smoke|standard|hardcore)" >&2; exit 2 ;; esac
 
 say()  { printf '\033[1;36m[wizard]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[wizard]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[wizard] FATAL:\033[0m %s\n' "$*" >&2; exit 1; }
 
-# SAFETY: this script rm -rf's paths under $WORK, and $WORK sits on a mount shared
-# with unrelated projects. Refuse any WORK that is empty, relative, a system dir, a
-# bare mount root, or the assets dir — a typo there must never eat someone's work.
+# ---------------------------------------------------- 1. path safety (identity)
+# A depth/blacklist check cannot tell /data/medvoice from /data/briefer, so the
+# real gate is a marker file this wizard owns. Existing medvoice workspaces are
+# adopted automatically; anything else non-empty aborts.
 validate_paths() {
-  [[ -n "${WORK:-}" ]] || die "WORK is empty."
-  [[ "$WORK" = /* ]]   || die "WORK must be an absolute path (got '$WORK')."
-  case "${WORK%/}" in
-    ""|"/"|"/data"|"/root"|"/home"|"/usr"|"/etc"|"/var"|"/opt"|"/srv"|"/mnt"|"/tmp")
-      die "refusing to use WORK='$WORK' — that is a system/mount root, not a workspace." ;;
-  esac
-  [[ $(awk -F/ '{c=0; for(i=1;i<=NF;i++) if($i!="") c++; print c}' <<<"${WORK%/}") -ge 2 ]] \
-    || die "WORK='$WORK' is too shallow; use something like /data/medvoice."
-  if [[ -n "${SES:-}" && "${WORK%/}" == "${SES%/}" ]]; then
-    die "WORK and SES are the same path ('$WORK') — that would delete your model assets."
+  local p
+  for p in WORK VENV; do
+    [[ -n "${!p:-}" ]]  || die "$p is empty."
+    [[ "${!p}" = /* ]]  || die "$p must be an absolute path (got '${!p}')."
+  done
+  # resolve symlinks so a symlinked WORK cannot redirect rm -rf into another project
+  WORK=$(readlink -f "$WORK" 2>/dev/null || echo "$WORK")
+  VENV=$(readlink -f "$VENV" 2>/dev/null || echo "$VENV")
+  SES=$(readlink -f "$SES"  2>/dev/null || echo "$SES")
+
+  for p in "$WORK" "$VENV"; do
+    case "${p%/}" in
+      ""|"/"|"/data"|"/root"|"/home"|"/usr"|"/etc"|"/var"|"/opt"|"/srv"|"/mnt"|"/tmp"|"/boot")
+        die "refusing to use '$p' — that is a system/mount root, not a workspace." ;;
+    esac
+    [[ $(awk -F/ '{c=0; for(i=1;i<=NF;i++) if($i!="") c++; print c}' <<<"${p%/}") -ge 2 ]] \
+      || die "'$p' is too shallow; use something like /data/medvoice."
+  done
+  [[ "${WORK%/}" != "${SES%/}" ]] || die "WORK == SES ('$WORK') — that would delete your model assets."
+  case "${WORK%/}" in "${SES%/}"/*) die "WORK ('$WORK') is inside SES — cleaning would hit your assets." ;; esac
+  case "${VENV%/}" in "${WORK%/}"/*) die "VENV ('$VENV') is inside WORK — cleaning would delete your venv." ;; esac
+
+  # IDENTITY GATE: only ever clean a directory this wizard created or adopted.
+  local marker="${WORK%/}/$MARKER_NAME"
+  if [[ -d "$WORK" && ! -e "$marker" ]]; then
+    if [[ -f "${WORK%/}/turkish_medvoice.py" || -f "${WORK%/}/roadmap_state.json" \
+          || -f "${WORK%/}/data/align.jsonl" ]]; then
+      say "adopting existing medvoice workspace at $WORK"
+    elif [[ -n "$(ls -A "$WORK" 2>/dev/null)" ]]; then
+      die "WORK='$WORK' is non-empty and carries no $MARKER_NAME marker — refusing to
+  clean a directory this wizard did not create. If this really is your medvoice
+  workspace, adopt it deliberately:   touch '$marker'"
+    fi
   fi
-  case "${WORK%/}" in
-    "${SES%/}"/*) die "WORK ('$WORK') is inside SES ('$SES') — cleaning would hit your assets." ;;
-  esac
+  mkdir -p "$WORK" || die "cannot create WORK='$WORK'."
+  : >"$marker"     || die "cannot write workspace marker '$marker'."
+  say "workspace: $WORK (marker ok)"
 }
 
-# ------------------------------------------------------- 1. resource helpers
+# ------------------------------------------------------- 2. resource helpers
 disk_pct()     { df -P  "$1" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5+0}'; }
 disk_free_gb() { df -PBG "$1" 2>/dev/null | awk 'NR==2{gsub(/G/,"",$4); print $4+0}'; }
+# MemAvailable already discounts reclaimable page cache, so this is true pressure.
 ram_pct()      { free 2>/dev/null | awk '/^Mem:/{printf "%d", ($2-$7)*100/$2}'; }
 vram_pct()     {
   if ! command -v nvidia-smi >/dev/null 2>&1; then echo 0; return; fi
@@ -81,24 +113,24 @@ vram_pct()     {
     | awk -F', ' 'NR==1{printf "%d", $1*100/$2}' || echo 0
 }
 
-# Free space WITHOUT destroying anything the run still needs.
+# Free space WITHOUT destroying anything the run still needs. Deliberately does
+# NOT touch *.jsonl.tmp (the trainer's in-flight atomic manifest writes) and only
+# sweeps OUR hf cache, never the shared ~/.cache/huggingface used by other projects.
 prune_safe() {
-  find "$WORK" \( -name '*.tmp' -o -name '*.jsonl.tmp' \) -delete 2>/dev/null || true
-  find "${HF_HOME:-$WORK/hf_cache}" ~/.cache/huggingface -name '*.incomplete' -delete 2>/dev/null || true
+  find "${HF_HOME:-$WORK/hf_cache}" -name '*.incomplete' -delete 2>/dev/null || true
   rm -rf "${WORK:?}/bench_results"/* 2>/dev/null || true
-  find "$WORK/logs" -name '*.log' -size +512M -exec truncate -s 64M {} \; 2>/dev/null || true
-  command -v pip     >/dev/null 2>&1 && pip cache purge >/dev/null 2>&1 || true
-  command -v apt-get >/dev/null 2>&1 && apt-get clean   >/dev/null 2>&1 || true
+  find "$WORK/logs" -maxdepth 2 -name '*.log' -size +512M -exec truncate -s 64M {} \; 2>/dev/null || true
+  command -v pip >/dev/null 2>&1 && "$PY" -m pip cache purge >/dev/null 2>&1 || true
   sync || true
 }
 
-# ------------------------------------------------- 2. background resource cop
+# ------------------------------------------------- 3. background resource cop
 start_watchdog() {
   local logf="$WORK/logs/watchdog.log"
   mkdir -p "$WORK/logs"
   (
     set +e                                  # a probe failure must never kill the cop
-    gone=0
+    seen=0
     while true; do
       sleep 60
       d=$(disk_pct "$WORK"); r=$(ram_pct); v=$(vram_pct)
@@ -110,27 +142,26 @@ start_watchdog() {
         prune_safe >>"$logf" 2>&1
         d=$(disk_pct "$WORK"); d=${d:-0}
       fi
-      if [ "$r" -ge "$RAM_WARN" ]; then
-        echo "$(date +%H:%M:%S) ram ${r}% -> dropping page cache" >>"$logf"
-        sync; echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
-        r=$(ram_pct); r=${r:-0}
-      fi
-      if [ "$v" -ge "$VRAM_WARN" ]; then
-        echo "$(date +%H:%M:%S) vram ${v}% (trainer shrinks max_seq_len itself)" >>"$logf"
-      fi
+      [ "$r" -ge 85 ] && echo "$(date +%H:%M:%S) ram ${r}% (MemAvailable-based; page cache already discounted)" >>"$logf"
+      [ "$v" -ge "$VRAM_WARN" ] && echo "$(date +%H:%M:%S) vram ${v}% (trainer shrinks max_seq_len itself)" >>"$logf"
 
       # about to max out -> stop the run cleanly rather than die from ENOSPC/OOM
       if [ "$d" -ge "$DISK_STOP" ] || [ "$r" -ge "$RAM_STOP" ]; then
         echo "$(date +%H:%M:%S) CRITICAL disk=${d}% ram=${r}% -> STOPPING the run" >>"$logf"
-        pkill -INT -f turkish_medvoice.py 2>/dev/null    # SIGINT: lets it checkpoint
+        pkill -INT -f "$WORK/turkish_medvoice.py" 2>/dev/null   # SIGINT: lets it checkpoint
         sleep 30
-        pkill -9   -f turkish_medvoice.py 2>/dev/null
+        pkill -9   -f "$WORK/turkish_medvoice.py" 2>/dev/null
         exit 0
       fi
 
-      # exit once the trainer has finished (5 consecutive misses)
-      if pgrep -f turkish_medvoice.py >/dev/null 2>&1; then gone=0; else gone=$((gone+1)); fi
-      [ "$gone" -ge 5 ] && { echo "$(date +%H:%M:%S) trainer gone -> watchdog exit" >>"$logf"; exit 0; }
+      # Exit only AFTER we have seen the trainer and it then disappears, so the
+      # cop can never disarm itself during the long setup/download phase.
+      if pgrep -f "$WORK/turkish_medvoice.py" >/dev/null 2>&1; then
+        seen=1; gone=0
+      elif [ "$seen" -eq 1 ]; then
+        gone=$((gone+1))
+        [ "$gone" -ge 3 ] && { echo "$(date +%H:%M:%S) trainer finished -> watchdog exit" >>"$logf"; exit 0; }
+      fi
     done
   ) &
   WATCHDOG_PID=$!
@@ -138,31 +169,27 @@ start_watchdog() {
   trap 'kill "$WATCHDOG_PID" 2>/dev/null || true' EXIT
 }
 
-# ---------------------------------------------------------- 2b. venv bootstrap
-# The venv dir may exist but be empty/broken (no bin/python). Falling back to the
-# system interpreter would scatter multi-GB wheels into /usr and break the TTS
-# server, so build a real venv instead.
+# ---------------------------------------------------------- 4. venv bootstrap
 ensure_venv() {
   PY="$VENV/bin/python"
-  if [[ -x "$PY" ]]; then say "venv: $VENV"; return 0; fi
-  if [[ -e "$VENV" && ! -d "$VENV" ]]; then die "$VENV exists but is not a directory."; fi
+  if [[ -x "$PY" ]] && "$PY" -c 'import sys' >/dev/null 2>&1; then say "venv: $VENV"; return 0; fi
+  [[ -e "$VENV" && ! -d "$VENV" ]] && die "$VENV exists but is not a directory."
 
   local base; base=$(command -v python3) || die "no python3 on PATH to build a venv with."
   if [[ -d "$VENV" ]]; then
-    local n; n=$(ls -A "$VENV" 2>/dev/null | wc -l | tr -d ' ')
-    warn "no interpreter at $PY — $VENV exists but holds $n entries; repairing it."
+    warn "no working interpreter at $PY ($(ls -A "$VENV" 2>/dev/null | wc -l | tr -d ' ') entries) — repairing."
   fi
   say "creating venv at $VENV (base: $base) ..."
   if ! "$base" -m venv "$VENV" >/dev/null 2>&1; then
     warn "python3 -m venv failed — installing python3-venv and retrying ..."
     if command -v apt-get >/dev/null 2>&1; then
-      apt-get update -qq >/dev/null 2>&1 || true
-      apt-get install -y python3-venv python3-dev >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq </dev/null >/dev/null 2>&1 || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv python3-dev </dev/null >/dev/null 2>&1 || true
     fi
-    "$base" -m venv "$VENV" >/dev/null 2>&1 || {
-      warn "still failing — recreating from scratch (--clear) ..."
+    if ! "$base" -m venv "$VENV" >/dev/null 2>&1; then
+      warn "recreating the venv from scratch (--clear wipes $VENV) ..."
       "$base" -m venv --clear "$VENV" || die "could not create a venv at $VENV"
-    }
+    fi
   fi
   PY="$VENV/bin/python"
   [[ -x "$PY" ]] || die "venv created but $PY is missing."
@@ -170,13 +197,12 @@ ensure_venv() {
   say "venv ready: $PY ($("$PY" -V 2>&1))"
 }
 
-# ------------------------------------------------------------ 3. asset detect
+# ------------------------------------------------------------ 5. asset detect
 has_hf_weights() {
   compgen -G "$1/model*.safetensors" >/dev/null 2>&1 && return 0
   compgen -G "$1/pytorch_model*.bin" >/dev/null 2>&1 && return 0
   return 1
 }
-
 # A usable training encoder must be an HF transformers Whisper dir. A CTranslate2 /
 # faster-whisper export (model.bin + vocabulary.*) looks similar but cannot be loaded.
 is_hf_whisper() {
@@ -188,13 +214,15 @@ is_hf_whisper() {
 detect_assets() {
   [[ -d "$SES" ]] || die "assets dir not found: $SES   (export SES=/path/to/ses_models)"
 
-  # OmniVoice TTS: whatever omnivoice-* dir exists (ft1, v3, ...) — newest wins
-  OMNI_DIR=$(find "$SES" -maxdepth 1 -type d -name 'omnivoice*' | sort -V | tail -1)
-  [[ -n "$OMNI_DIR" ]] || die "no omnivoice* model dir under $SES"
+  # OmniVoice TTS: newest-by-name that actually looks like a model dir
+  OMNI_DIR=""
+  while read -r d; do
+    [[ -z "$d" ]] && continue
+    if [[ -f "$d/config.json" ]] && has_hf_weights "$d"; then OMNI_DIR="$d"; break; fi
+  done < <(find "$SES" -maxdepth 1 -type d -name 'omnivoice*' | sort -Vr)
+  [[ -n "$OMNI_DIR" ]] || die "no usable omnivoice* model dir under $SES (need config.json + weights)."
 
-  # Whisper encoder MUST be HF-format; a *-ct2 (CTranslate2) export cannot be loaded
-  # by transformers, so fall back to the base model rather than crash mid-training.
-  # An explicit WHISPER=/path (or a pre-set TMV_WHISPER_CKPT) always wins.
+  # explicit WHISPER=/path (or a pre-set TMV_WHISPER_CKPT) always wins
   WHISPER_DIR="${WHISPER:-${TMV_WHISPER_CKPT:-}}"
   if [[ -n "$WHISPER_DIR" ]]; then
     say "whisper pinned by env -> $WHISPER_DIR"
@@ -203,22 +231,16 @@ detect_assets() {
       warn "  fall back to the base model. Unset WHISPER/TMV_WHISPER_CKPT to auto-detect."
     fi
   else
-    # search *hf* names first, then anything else; format check is the real gate
     while read -r d; do
       [[ -z "$d" ]] && continue
       if is_hf_whisper "$d"; then WHISPER_DIR="$d"; break; fi
     done < <( { find "$SES" -maxdepth 1 -type d -name 'whisper*hf*';
                 find "$SES" -maxdepth 1 -type d -name 'whisper*' ! -name '*hf*'; } 2>/dev/null )
   fi
-
   if [[ -z "$WHISPER_DIR" ]]; then
     WHISPER_DIR="openai/whisper-large-v3-turbo"
-    local found; found=$(find "$SES" -maxdepth 1 -type d -name 'whisper*' -printf '%f ' 2>/dev/null || true)
-    warn "no HF-format Whisper under $SES (found: ${found:-none})."
-    warn "  A CTranslate2/faster-whisper export CANNOT be used as a training encoder."
-    warn "  -> using BASE $WHISPER_DIR. Training works, but you lose your Turkish"
-    warn "     fine-tune's encoder quality. To keep it, place its HF export"
-    warn "     (config.json with model_type=whisper + model.safetensors) under $SES."
+    warn "no HF-format Whisper under $SES — a CTranslate2 export CANNOT be a training"
+    warn "  encoder, so using BASE $WHISPER_DIR. You lose your Turkish fine-tune's encoder."
   fi
 
   REF_WAV="$SES/ref/emin.wav"; REF_TXT="$SES/ref/emin.txt"; APP_DIR="$SES/app"
@@ -229,17 +251,14 @@ detect_assets() {
   say "  tts app dir     : $APP_DIR"
 }
 
-# ------------------------------------------------- 4. size the run to the disk
-# ~0.25 MB per synthesized clip; scale the targets so we cannot fill the SSD.
+# ------------------------------------------------- 6. size the run to the disk
 autoscale_to_disk() {
   local free usable max_clips want
   free=$(disk_free_gb "$WORK"); free=${free:-0}
   usable=$(( free - RESERVE_GB ))
   say "free disk at $WORK: ${free}GB (reserve ${RESERVE_GB}GB) -> ${usable}GB for speech synthesis"
-  if [ "$usable" -lt 3 ]; then
-    die "only ${free}GB free — free space, lower RESERVE_GB, or use --clean full."
-  fi
-  max_clips=$(( usable * 1024 * 4 ))                 # ~4 clips per MB
+  [ "$usable" -lt 3 ] && die "only ${free}GB free — free space, lower RESERVE_GB, or use --clean full."
+  max_clips=$(( usable * 1024 * 4 ))                 # ~0.25MB per clip
   case "$PRESET" in
     smoke)    want_s2s=800;    want_med=400   ;;
     hardcore) want_s2s=120000; want_med=60000 ;;
@@ -255,44 +274,62 @@ autoscale_to_disk() {
   export TMV_N_S2S=$want_s2s TMV_N_MED=$want_med
 }
 
-# ------------------------------------------------------------- 5. clean phase
+# ------------------------------------------------------------- 7. clean phase
 clean_previous() {
   local -a targets=(
     "$WORK/checkpoints" "$WORK/bench_results" "$WORK/logs"
     "$WORK/roadmap_state.json" "$WORK/vocab_ext.json"
   )
-  if [[ "$CLEAN" == "full" || "$CLEAN" == "all" ]]; then targets+=("$WORK/data"); fi
-  if [[ "$CLEAN" == "all" ]]; then targets+=("$WORK/hf_cache"); fi
+  [[ "$CLEAN" == "full" || "$CLEAN" == "all" ]] && targets+=("$WORK/data")
+  [[ "$CLEAN" == "all" ]] && targets+=("$WORK/hf_cache")
 
-  say "clean mode '$CLEAN' — the following are from previous runs and all regenerable:"
   local found=0 t
-  for t in "${targets[@]}"; do
-    if [[ -e "$t" ]]; then
-      printf '    %-44s %s\n' "$t" "$(du -sh "$t" 2>/dev/null | cut -f1)"
-      found=1
-    fi
-  done
-  if [ "$found" -eq 0 ]; then say "    (nothing to clean)"; fi
-  say "NOT touched: $SES, $VENV, other projects under /data, tmux sessions."
+  for t in "${targets[@]}"; do [[ -e "$t" ]] && found=1; done
+  if [ "$found" -eq 0 ]; then say "clean ($CLEAN): nothing from a previous run."; return 0; fi
 
-  if [ "$found" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then
+  say "clean mode '$CLEAN' — these are from previous runs and all regenerable:"
+  for t in "${targets[@]}"; do
+    [[ -e "$t" ]] && printf '    %-44s %s\n' "$t" "$(du -sh "$t" 2>/dev/null | cut -f1)"
+  done
+  say "NOT touched: $SES, $VENV, and everything outside $WORK."
+
+  if [ "$ASSUME_YES" -eq 0 ]; then
+    if [ ! -t 0 ]; then
+      die "stdin is not a terminal, so the delete confirmation cannot be shown.
+  Re-run with --yes to confirm non-interactively, or run it in a tmux/ssh shell."
+    fi
     printf '\033[1;33m[wizard]\033[0m delete the above? [y/N] '
-    read -r ans
-    [[ "$ans" =~ ^[Yy]$ ]] || die "aborted by user."
+    read -r ans || die "no answer read; aborting without deleting."
+    [[ "$ans" =~ ^[Yy]$ ]] || die "aborted by user (nothing deleted)."
   fi
-  pkill -9 -f turkish_medvoice.py 2>/dev/null || true
+
+  # stop only OUR trainer, and give it a chance to checkpoint first
+  if pgrep -f "$WORK/turkish_medvoice.py" >/dev/null 2>&1; then
+    say "stopping a running trainer from this workspace (SIGINT, 15s grace) ..."
+    pkill -INT -f "$WORK/turkish_medvoice.py" 2>/dev/null || true
+    sleep 15
+    pkill -9   -f "$WORK/turkish_medvoice.py" 2>/dev/null || true
+  fi
   for t in "${targets[@]}"; do rm -rf "$t"; done
-  find "$WORK" \( -name '*.tmp' -o -name '*.jsonl.tmp' \) -delete 2>/dev/null || true
-  find ~/.cache/huggingface -name '*.incomplete' -delete 2>/dev/null || true
-  mkdir -p "$WORK" "$WORK/logs"
+  find "$WORK" -maxdepth 4 \( -name '*.tmp' -o -name '*.jsonl.tmp' \) -delete 2>/dev/null || true
   say "clean done."
 }
 
-# ------------------------------------------------------------ 6. TTS server
+# ------------------------------------------------------------ 8. TTS server
 tts_up() { curl -sS -o /dev/null --max-time 4 "http://127.0.0.1:$PORT_TTS/" >/dev/null 2>&1; }
 
 start_tts() {
-  if tts_up; then say "OmniVoice TTS already up on :$PORT_TTS"; return 0; fi
+  TTS_PID_FILE="$WORK/$MARKER_NAME.tts.pid"      # outside logs/, which clean wipes
+  if tts_up; then say "OmniVoice TTS already up on :$PORT_TTS (reusing it)"; return 0; fi
+  # reap an orphan from an aborted run that is holding VRAM but not serving
+  if [[ -f "$TTS_PID_FILE" ]]; then
+    local old; old=$(cat "$TTS_PID_FILE" 2>/dev/null || echo "")
+    if [[ -n "$old" ]] && kill -0 "$old" 2>/dev/null; then
+      warn "orphan TTS pid $old is alive but not serving — terminating it."
+      kill "$old" 2>/dev/null || true; sleep 5; kill -9 "$old" 2>/dev/null || true
+    fi
+    rm -f "$TTS_PID_FILE"
+  fi
   if [[ ! -f "$APP_DIR/omnivoice_server.py" ]]; then
     warn "no $APP_DIR/omnivoice_server.py — cannot start TTS automatically."
     return 0
@@ -303,11 +340,11 @@ start_tts() {
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   nohup "$PY" -m uvicorn omnivoice_server:app --app-dir "$APP_DIR" \
         --host 127.0.0.1 --port "$PORT_TTS" >>"$WORK/logs/tts_server.log" 2>&1 &
-  echo $! >"$WORK/logs/.tts.pid"
+  echo $! >"$TTS_PID_FILE"
   local i
   for i in $(seq 1 40); do
     sleep 3
-    if tts_up; then say "TTS is up (pid $(cat "$WORK/logs/.tts.pid"))."; return 0; fi
+    if tts_up; then say "TTS is up (pid $(cat "$TTS_PID_FILE"))."; return 0; fi
   done
   warn "TTS did not come up in 120s — see $WORK/logs/tts_server.log"
   warn "  data would be built TEXT-ONLY and the run will stop at the speech gate."
@@ -316,17 +353,23 @@ start_tts() {
 
 # ===================================================================== MAIN ==
 say "=== turkish-medvoice run wizard ==="
-[[ $EUID -eq 0 ]] || warn "not root: page-cache drop / apt clean will be skipped."
+[[ $EUID -eq 0 ]] || warn "not root: apt-get fallbacks in venv setup will be skipped."
 
 validate_paths
 ensure_venv
-
-mkdir -p "$WORK" "$WORK/logs"
 clean_previous
+mkdir -p "$WORK/logs"
 detect_assets
 
 say "fetching the latest trainer from GitHub ..."
-curl -fsSL "$RAW_URL" -o "$WORK/turkish_medvoice.py" || die "download failed: $RAW_URL"
+# atomic + bounded: never clobber a good copy with a truncated/stalled download
+curl -fsSL --max-time 300 --retry 3 --retry-delay 5 "$RAW_URL" -o "$WORK/turkish_medvoice.py.part" \
+  || die "download failed: $RAW_URL"
+head -1 "$WORK/turkish_medvoice.py.part" | grep -q '^#!' \
+  || die "downloaded trainer does not look like a script — refusing to run it."
+"$PY" -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$WORK/turkish_medvoice.py.part" \
+  || die "downloaded trainer failed to parse — refusing to run a truncated file."
+mv -f "$WORK/turkish_medvoice.py.part" "$WORK/turkish_medvoice.py"
 say "trainer: $WORK/turkish_medvoice.py ($(wc -l <"$WORK/turkish_medvoice.py") lines)"
 
 # ---- the full environment the trainer needs --------------------------------
@@ -337,7 +380,12 @@ export TMV_TTS_MODE=http TMV_OMNI_URL="http://127.0.0.1:$PORT_TTS/v1/audio/speec
 export TMV_OMNI_VENV_PY="$PY" TMV_OMNI_APP_DIR="$APP_DIR"
 export HF_HOME="${HF_HOME:-$WORK/hf_cache}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# VRAM ceilings — the trainer shrinks max_seq_len before it can OOM
+# VRAM ceilings. These OVERRIDE the preset (env wins in the trainer) — say so out
+# loud rather than silently downgrading a hardcore run.
+if [[ -z "${TMV_MAXSEQ:-}" && "$PRESET" == "hardcore" ]]; then
+  say "note: capping TMV_MAXSEQ=2048 for VRAM safety (hardcore's default is 4096)."
+  say "      export TMV_MAXSEQ=4096 before running to keep the preset value."
+fi
 export TMV_MAXSEQ=${TMV_MAXSEQ:-2048} TMV_MAX_AUDIO_SEC=${TMV_MAX_AUDIO_SEC:-20}
 export TMV_VRAM_GUARD=${TMV_VRAM_GUARD:-0.88} TMV_VRAM_SHRINK=${TMV_VRAM_SHRINK:-0.92}
 export TMV_SYNTH_WORKERS=${TMV_SYNTH_WORKERS:-2}
@@ -352,6 +400,7 @@ env | grep -E '^(TMV_|HF_HOME|PYTORCH_CUDA)' | sort | sed 's/^/    /'
 if [ "$DO_RUN" -eq 0 ]; then
   say "--no-run: setup complete. Start it with:"
   say "  cd $WORK && $PY turkish_medvoice.py --preset $PRESET auto"
+  say "  (the TTS server on :$PORT_TTS is left running for that run)"
   exit 0
 fi
 
