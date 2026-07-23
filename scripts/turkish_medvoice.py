@@ -12,18 +12,24 @@ comprehensive "best-in-era" Turkish native-voice benchmark against baselines.
 
 WHY "native" (and not a cascade)?
 ---------------------------------
-A cascade (STT -> text-LLM -> TTS) waits for the *whole* transcript, then the
-*whole* response, then the *whole* synthesis before the first audio plays. This
-model (a) skips the Whisper ASR *decoder* entirely — the frozen Whisper *encoder*
-features feed the LLM directly — and (b) can STREAM: the LLM emits Turkish response
-text incrementally and the OmniVoice tail starts speaking the first chunk while the
-LLM is still generating, so first-audio latency drops from "sum of three full
-stages" to "encoder pass + first text chunk + one OmniVoice chunk (RTF ~0.025)".
-That streaming path is exposed at POST /v1/audio/voice-chat/stream (chunked 24kHz
-PCM); the plain POST /v1/audio/voice-chat returns the full turn as one WAV for
-clients that cannot consume a stream. In BOTH, the clinical safety intent-gate runs
-on the whole utterance FIRST and fails CLOSED (refuses rather than answers if the
-gate transcript is unavailable).
+For the ANSWER path the frozen Whisper *encoder* features feed the LLM directly
+(no Whisper text decode), and generation STREAMS: the LLM emits Turkish response
+text incrementally and the OmniVoice tail speaks the first chunk while the LLM is
+still generating — so answer-side first-audio is "first text chunk + one OmniVoice
+chunk (RTF ~0.025)", not the sum of three full stages.
+
+HONEST latency caveat: this is turn-based, NOT full-duplex. The clinical safety
+intent-gate runs a FULL Whisper ASR (encoder+decoder) on the WHOLE utterance FIRST
+(fail-closed: it refuses rather than answers if that transcript is unavailable), and
+the HTTP endpoints read the entire uploaded clip before starting. So true first-audio
+is (utterance-end) + full-gate-ASR + first-text-chunk + one TTS chunk. Sub-300ms,
+barge-in, and speak-while-listening are architecturally OUT OF SCOPE here; they need
+a native full-duplex core (separate track). Endpoints:
+  POST /v1/audio/voice-chat         -> one WAV; X-User-Text + X-Response-Text headers
+  POST /v1/audio/voice-chat/stream  -> chunked 24kHz PCM (audio only)
+  POST /v1/audio/voice-chat/events  -> SSE: user transcript + live reply text + audio
+  GET  /voices                      -> selectable voices (voice bank)
+All accept an optional `voice` (voice-bank id) for per-request OmniVoice cloning.
 
 ARCHITECTURE  (all generative parts are Apache/MIT so the product is shippable)
 --------------------------------------------------------------------------------
@@ -53,8 +59,9 @@ SUBCOMMANDS
           (instruction_speech, response_text, response_speech) triples  [cached]
   train   --stage {align,s2s,medical,distill} [--resume]   QLoRA, checkpoint/resume
   eval    --suite {asr,tts,s2s,medical,all} [--baselines ...]   the full benchmark
-  serve   native S2S API: /voice-chat (full-turn WAV) + /voice-chat/stream
-          (chunked low-latency PCM); safety gate fails CLOSED  (--cascade fallback)
+  serve   S2S API: /voice-chat (WAV+text headers), /voice-chat/stream (PCM),
+          /voice-chat/events (SSE dual text+voice), /voices; gate fails CLOSED
+          (--cascade fallback). Turn-based, not full-duplex (see module docstring).
   doctor  preflight + AUTO-FIX (CUDA/MIG env, missing deps, low disk, asset paths,
           TTS reachability with autostart, HF auth)
   auto    run the WHOLE roadmap unattended (doctor->data->train*->eval), resumable
@@ -170,6 +177,10 @@ class Config:
     omni_ref_wav:      str = _env("TMV_OMNI_REF", "/root/ses_models/ref/emin.wav")
     omni_ref_txt:      str = _env("TMV_OMNI_REFTXT", "/root/ses_models/ref/emin.txt")
     omni_lang:         str = _env("TMV_OMNI_LANG", "tr")
+    # VOICE BANK: JSON manifest of selectable voices, each a consented/synthetic
+    # reference clip: [{"id","ref_wav","ref_text","gender","consent","source"}].
+    # Empty -> only the built-in default voice (omni_ref_wav) is offered.
+    voice_bank:        str = _env("TMV_VOICE_BANK", "")
     # OpenAI-compatible endpoints you already run (used as robust TTS/STT fallbacks)
     omni_server_url:   str = _env("TMV_OMNI_URL", "http://127.0.0.1:8133/v1/audio/speech")
     stt_server_url:    str = _env("TMV_STT_URL",  "http://127.0.0.1:8135/v1/audio/transcriptions")
@@ -1516,8 +1527,10 @@ class TTSBackend:
     def available(self):
         return self.mode is not None
 
-    def synth(self, text, out_path=None, ref_wav=None):
+    def synth(self, text, out_path=None, ref_wav=None, ref_text=None):
         """Return 24 kHz float32 mono np.ndarray (and write WAV if out_path).
+        ref_wav/ref_text select a VOICE per request (OmniVoice zero-shot clone);
+        None uses the server-side default voice.
         SELF-HEAL: on an HTTP failure, try to bring the server back up and retry
         once before raising."""
         import numpy as np
@@ -1528,11 +1541,11 @@ class TTSBackend:
             wav, sr = self._py(text, ref_wav or self.cfg.omni_ref_wav)
         elif self.mode == "http":
             try:
-                wav, sr = self._http(text)
+                wav, sr = self._http(text, ref_wav, ref_text)
             except Exception as e:
                 log(f"[heal] TTS request failed ({e}); attempting recovery.", err=True)
                 if _ensure_tts_server(self.cfg):
-                    wav, sr = self._http(text)      # retry once after recovery
+                    wav, sr = self._http(text, ref_wav, ref_text)   # retry after recovery
                 else:
                     raise
         else:
@@ -1543,15 +1556,19 @@ class TTSBackend:
             sf.write(out_path, wav, sr)
         return wav, sr
 
-    def _http(self, text):
-        # Body matches the user's OmniVoice server contract (README):
-        #   POST /v1/audio/speech  {"input": ..., "language": "tr"}  -> WAV 24kHz.
-        # The clone reference voice (OMNI_REF) is configured server-side, so no
-        # voice field is sent here. `voice` is added only if TMV sets it.
+    def _http(self, text, ref_wav=None, ref_text=None):
+        # Body matches the user's OmniVoice server contract (README): the server
+        # accepts per-request ref_wav/ref_text for zero-shot voice cloning
+        #   POST /v1/audio/speech  {"input","language","ref_wav?","ref_text?"} -> WAV 24kHz.
+        # Forward them so the VOICE BANK works (the old client dropped ref_wav).
         import io
         import requests
         import soundfile as sf
         payload = {"input": text, "language": self.cfg.omni_lang}
+        if ref_wav:
+            payload["ref_wav"] = ref_wav
+        if ref_text:
+            payload["ref_text"] = ref_text
         voice = os.environ.get("TMV_OMNI_VOICE")
         if voice:
             payload["voice"] = voice
@@ -4259,10 +4276,11 @@ def cmd_serve(args):
     CFG.ensure_dirs()
     log(f"=== SERVE ({'cascade' if args.cascade else 'native'}) on "
         f"{CFG.serve_host}:{CFG.serve_port} ===")
+    import base64
     import io
     import numpy as np
     import soundfile as sf
-    from fastapi import FastAPI, UploadFile, File
+    from fastapi import FastAPI, UploadFile, File, Form
     from fastapi.responses import Response, StreamingResponse
     import uvicorn
 
@@ -4271,6 +4289,37 @@ def cmd_serve(args):
     state = {}
     FAIL_CLOSED = ("Sesinizi tam olarak çözümleyemedim. Durum acilse lütfen 112'yi arayın; "
                    "aksi halde lütfen bir hekime danışın.")
+
+    # ---- VOICE BANK: selectable voices (OmniVoice zero-shot clone per request) ----
+    def _load_voice_bank():
+        """id -> {ref_wav, ref_text, ...}. Always includes the built-in default."""
+        bank = {"default": {"ref_wav": None, "ref_text": None, "source": "server-default"}}
+        try:
+            def _rt(p):
+                try:
+                    return Path(p).with_suffix(".txt").read_text(encoding="utf-8").strip() if p else None
+                except Exception:
+                    return None
+            if CFG.omni_ref_wav and Path(CFG.omni_ref_wav).exists():
+                bank["emin"] = {"ref_wav": CFG.omni_ref_wav,
+                                "ref_text": (_rt(CFG.omni_ref_txt) or _rt(CFG.omni_ref_wav)),
+                                "gender": "male", "source": "consented"}
+            if CFG.voice_bank and Path(CFG.voice_bank).exists():
+                for v in json.loads(Path(CFG.voice_bank).read_text(encoding="utf-8")):
+                    vid = str(v.get("id") or "").strip()
+                    if vid and v.get("ref_wav"):
+                        v.setdefault("ref_text", _rt(v["ref_wav"]))
+                        bank[vid] = v
+        except Exception as e:
+            log(f"[voice] bank load issue ({e}); using default only.", err=True)
+        return bank
+
+    VOICES = _load_voice_bank()
+
+    def _resolve_voice(voice_id):
+        """(ref_wav, ref_text) for a voice id; falls back to server default."""
+        v = VOICES.get((voice_id or "").strip() or "default", VOICES["default"])
+        return v.get("ref_wav"), v.get("ref_text")
 
     def _serve_gate(wav16):
         """Transcribe for the safety intent-gate. Returns (question, gate_active).
@@ -4298,11 +4347,12 @@ def cmd_serve(args):
         gen = model.generate_ids(wav16, "", max_new_tokens=256)
         return tok.decode(gen[0], skip_special_tokens=True)
 
-    def _pcm(text, gaz):
-        """Synthesize one text chunk to 24kHz mono int16 PCM bytes (streaming frame)."""
+    def _pcm(text, gaz, ref_wav=None, ref_text=None):
+        """Synthesize one text chunk to 24kHz mono int16 PCM bytes (streaming frame),
+        in the selected voice (ref_wav/ref_text) or the server default."""
         if not tts.available() or not (text or "").strip():
             return b""
-        w, s = tts.synth(apply_pronunciation(text, gaz))
+        w, s = tts.synth(apply_pronunciation(text, gaz), ref_wav=ref_wav, ref_text=ref_text)
         x = np.asarray(w, dtype="float32").reshape(-1)
         if s != 24000:
             import librosa
@@ -4325,14 +4375,22 @@ def cmd_serve(args):
             state["model"], state["tok"] = model, tok
         state["ready"] = True
 
+    @app.get("/voices")
+    def voices():
+        """List selectable voices (ids + metadata; reference paths stay server-side)."""
+        return {"voices": [dict({"id": k}, **{m: v.get(m) for m in
+                 ("gender", "source", "consent") if v.get(m)}) for k, v in VOICES.items()]}
+
     @app.post("/v1/audio/voice-chat")
-    async def voice_chat(file: UploadFile = File(...)):
-        """Full-turn endpoint: returns one WAV for the whole answer (for clients that
-        can't consume a stream). For low first-audio latency use /voice-chat/stream."""
+    async def voice_chat(file: UploadFile = File(...), voice: str = Form(None)):
+        """Full-turn endpoint: returns one WAV for the whole answer plus BOTH texts as
+        headers (X-User-Text = what the user said, X-Response-Text = the reply). For
+        clients that can't consume a stream. For live dual captions use /events."""
         _lazy()
         raw = await file.read()
         wav, sr = sf.read(io.BytesIO(raw), dtype="float32")
         wav16 = _to16k(wav, sr)
+        ref_wav, ref_text = _resolve_voice(voice)
         # SAFETY runs FIRST and FAIL-CLOSED: a refusal or an unusable intent-gate
         # transcript preempts generation entirely.
         question, gate_active = _serve_gate(wav16)
@@ -4344,34 +4402,37 @@ def cmd_serve(args):
         else:
             text = safe_answer(CFG, question, _answer_text(wav16, question))
         gaz = load_gazetteer(CFG)
-        speech, srr = tts.synth(apply_pronunciation(text, gaz)) if tts.available() else (np.zeros(1), 24000)
+        speech, srr = (tts.synth(apply_pronunciation(text, gaz), ref_wav=ref_wav, ref_text=ref_text)
+                       if tts.available() else (np.zeros(1), 24000))
         b = io.BytesIO(); sf.write(b, speech, srr, format="WAV")
         from urllib.parse import quote
         return Response(content=b.getvalue(), media_type="audio/wav",
-                        headers={"X-Response-Text": quote(text[:2000]),
+                        headers={"X-User-Text": quote((question or "")[:2000]),
+                                 "X-Response-Text": quote(text[:2000]),
                                  "X-Gate-Active": str(gate_active)})
 
     @app.post("/v1/audio/voice-chat/stream")
-    async def voice_chat_stream(file: UploadFile = File(...)):
+    async def voice_chat_stream(file: UploadFile = File(...), voice: str = Form(None)):
         """Low-latency native V2V: streams 24kHz mono int16 PCM as the LLM generates.
         The safety intent-gate runs on the WHOLE utterance FIRST so a refusal preempts
         any audio; then answer text is chunked at sentence/clause boundaries and each
         chunk is synthesized while the LLM keeps generating (first-audio ~ one chunk,
-        not the whole turn)."""
+        not the whole turn). Audio-only; for text+audio together use /events."""
         _lazy()
         raw = await file.read()
         wav, sr = sf.read(io.BytesIO(raw), dtype="float32")
         wav16 = _to16k(wav, sr)
         gaz = load_gazetteer(CFG)
+        ref_wav, ref_text = _resolve_voice(voice)
         question, gate_active = _serve_gate(wav16)
         kind, refusal = safety_flag(question) if question else (None, None)
         media = "audio/L16; rate=24000"
         if refusal or not gate_active:
             msg = apply_disclaimer(CFG, refusal or FAIL_CLOSED)
-            return StreamingResponse(iter([_pcm(msg, gaz)]), media_type=media)
+            return StreamingResponse(iter([_pcm(msg, gaz, ref_wav, ref_text)]), media_type=media)
         if args.cascade:      # cascade has no token streamer here -> one-shot chunk
             text = safe_answer(CFG, question, _answer_text(wav16, question))
-            return StreamingResponse(iter([_pcm(text, gaz)]), media_type=media)
+            return StreamingResponse(iter([_pcm(text, gaz, ref_wav, ref_text)]), media_type=media)
 
         def audio_stream():
             from transformers import TextIteratorStreamer
@@ -4389,12 +4450,79 @@ def cmd_serve(args):
                 if _re.search(r"[.!?\n]", buf) or len(buf.split()) >= CFG.stream_chunk_tokens:
                     chunk, buf = buf.strip(), ""
                     if chunk:
-                        yield _pcm(chunk, gaz)          # per-chunk pronunciation-rewritten TTS
+                        yield _pcm(chunk, gaz, ref_wav, ref_text)
             if buf.strip():
-                yield _pcm(buf.strip(), gaz)
-            yield _pcm(CFG.med_disclaimer, gaz)         # spoken disclaimer at the end
+                yield _pcm(buf.strip(), gaz, ref_wav, ref_text)
+            yield _pcm(CFG.med_disclaimer, gaz, ref_wav, ref_text)   # spoken disclaimer
             th.join(timeout=60)
         return StreamingResponse(audio_stream(), media_type=media)
+
+    @app.post("/v1/audio/voice-chat/events")
+    async def voice_chat_events(file: UploadFile = File(...), voice: str = Form(None)):
+        """DUAL text+voice output (SSE). One connection carries, interleaved:
+             event: input_transcript  {text, gate_active}   # what the USER said
+             event: reply_text        {delta} | {text,final}# what the MODEL says
+             event: audio             {pcm_b64, rate:24000} # 16-bit LE PCM chunk
+             event: done              {reason}
+        The safety gate still runs FIRST and fails CLOSED (a refusal preempts audio).
+        NOTE: this is a turn-based pipeline (gate ASR runs on the whole utterance
+        before the reply) — it surfaces both transcripts live, but it is NOT a
+        full-duplex model; barge-in/overlap is a separate architecture track."""
+        _lazy()
+        raw = await file.read()
+        wav, sr = sf.read(io.BytesIO(raw), dtype="float32")
+        wav16 = _to16k(wav, sr)
+        gaz = load_gazetteer(CFG)
+        ref_wav, ref_text = _resolve_voice(voice)
+        question, gate_active = _serve_gate(wav16)
+        kind, refusal = safety_flag(question) if question else (None, None)
+
+        def sse(ev, obj):
+            return f"event: {ev}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+        def audio_ev(text):
+            pcm = _pcm(text, gaz, ref_wav, ref_text)
+            return sse("audio", {"pcm_b64": base64.b64encode(pcm).decode(), "rate": 24000})
+
+        def events():
+            yield sse("input_transcript", {"text": question or "", "gate_active": gate_active})
+            if refusal or not gate_active:
+                msg = apply_disclaimer(CFG, refusal or FAIL_CLOSED)
+                yield sse("reply_text", {"text": msg, "final": True})
+                yield audio_ev(msg)
+                yield sse("done", {"reason": "refused" if refusal else "fail_closed"})
+                return
+            if args.cascade:
+                text = safe_answer(CFG, question, _answer_text(wav16, question))
+                yield sse("reply_text", {"text": text, "final": True})
+                yield audio_ev(text)
+                yield sse("done", {"reason": "complete"})
+                return
+            from transformers import TextIteratorStreamer
+            import threading
+            import re as _re
+            model, tok = state["model"], state["tok"]
+            streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=True)
+            th = threading.Thread(target=model.generate_ids,
+                                  kwargs={"wav": wav16, "prompt_text": "",
+                                          "max_new_tokens": 256, "streamer": streamer})
+            th.start()
+            buf = ""
+            for piece in streamer:
+                if piece:
+                    yield sse("reply_text", {"delta": piece})   # live caption
+                buf += piece
+                if _re.search(r"[.!?\n]", buf) or len(buf.split()) >= CFG.stream_chunk_tokens:
+                    chunk, buf = buf.strip(), ""
+                    if chunk:
+                        yield audio_ev(chunk)
+            if buf.strip():
+                yield audio_ev(buf.strip())
+            yield sse("reply_text", {"text": CFG.med_disclaimer, "final": True})
+            yield audio_ev(CFG.med_disclaimer)
+            yield sse("done", {"reason": "complete"})
+            th.join(timeout=60)
+        return StreamingResponse(events(), media_type="text/event-stream")
 
     @app.get("/health")
     def health():
