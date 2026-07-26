@@ -2511,11 +2511,21 @@ def _extend_vocab(cfg, tok, llm, orig_vocab):
     BOTH embed_tokens and lm_head (untied). Returns the new token ids."""
     import torch
     ext_file = Path(cfg.work) / "vocab_ext.json"
-    toks = read_json(ext_file, None)
-    if not toks:
-        toks = _mine_vocab_candidates(cfg, tok, cfg.vocab_ext_k)
-        write_json(ext_file, toks)
-    # subword decomposition in the ORIGINAL vocab (before adding), for mean-init
+    mined = read_json(ext_file, None)
+    if not mined:
+        mined = _mine_vocab_candidates(cfg, tok, cfg.vocab_ext_k)
+        write_json(ext_file, mined)
+    # Add BOTH a bare and a LEADING-SPACE form of each mined word. In running text a
+    # word is space-preceded, and Qwen's byte-level BPE tokenizes " word" separately
+    # from "word": a bare token leaves the space as its own token, but a leading-space
+    # token absorbs it -> a real fertility win (probe: " amoksisilin" saved 2x the
+    # tokens the bare form did). The bare form still helps at sentence start / after
+    # punctuation. Mean-init each form from ITS OWN original-vocab subwords.
+    toks = []
+    for w in mined:
+        for form in (w, " " + w):
+            if form not in toks:
+                toks.append(form)
     sub_map = {t: tok(t, add_special_tokens=False).input_ids for t in toks}
     added = tok.add_tokens(toks)
     if added == 0:

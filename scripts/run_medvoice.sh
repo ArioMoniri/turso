@@ -38,7 +38,7 @@ RAM_STOP=${RAM_STOP:-95}
 VRAM_WARN=${VRAM_WARN:-92}
 RESERVE_GB=${RESERVE_GB:-30}                 # keep free for models/cache/checkpoints
 
-CLEAN=soft; ASSUME_YES=0; DO_RUN=1
+CLEAN=soft; ASSUME_YES=0; DO_RUN=1; EVAL_ONLY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --clean)
@@ -49,6 +49,8 @@ while [[ $# -gt 0 ]]; do
       PRESET="$2"; shift 2 ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --no-run) DO_RUN=0; shift ;;
+    # re-benchmark the EXISTING checkpoints (judge on) without cleaning or retraining
+    --eval-only) EVAL_ONLY=1; shift ;;
     -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -403,7 +405,15 @@ say "=== turkish-medvoice run wizard ==="
 validate_paths
 ensure_venv
 ensure_omni_venv
-clean_previous
+# --eval-only re-benchmarks the EXISTING checkpoints, so it must NOT clean (soft
+# clean would delete $WORK/checkpoints).
+if [ "$EVAL_ONLY" -eq 1 ]; then
+  [[ -f "$WORK/checkpoints/medical/projector.pt" ]] \
+    || die "--eval-only: no trained checkpoint at $WORK/checkpoints/medical — nothing to evaluate."
+  say "--eval-only: keeping checkpoints/data, re-running the benchmark with the judge."
+else
+  clean_previous
+fi
 mkdir -p "$WORK/logs"
 detect_assets
 
@@ -455,6 +465,16 @@ say "installing / verifying deps (setup) ..."
 "$PY" turkish_medvoice.py setup --skip-smoke
 say "preflight (doctor) ..."
 "$PY" turkish_medvoice.py doctor || warn "doctor reported issues — see above."
+
+if [ "$EVAL_ONLY" -eq 1 ]; then
+  # trustworthy re-benchmark: LLM-judge on (real correctness/safety), token_f1 on
+  export TMV_BENCH_JUDGE=1
+  say "re-benchmark: eval --suite all (judge=${TMV_JUDGE:-<config default, downloads a large model>})"
+  "$PY" turkish_medvoice.py eval --suite all
+  say "=== eval-only finished ===  report: $WORK/bench_results/bench_report.md"
+  exit 0
+fi
+
 say "roadmap: data -> train(align,s2s,medical) -> eval   [preset=$PRESET]"
 "$PY" turkish_medvoice.py --preset "$PRESET" auto
 say "=== wizard finished ==="
