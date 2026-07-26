@@ -4024,7 +4024,23 @@ def eval_judge_pass(cfg, limit=40):
         del model, tok; _free_gpu()
     except Exception as e:
         return {"error": f"native generation failed: {e}"}
-    return _llm_judge(cfg, triples)
+    # DUMP sample (question -> model answer) pairs so a bad correctness score can be
+    # diagnosed as empty/degenerate vs substantive-but-wrong. Written next to the
+    # report; also log a few + the mean answer length.
+    try:
+        dump = [{"q": t["q"], "hyp": t["hyp"], "hyp_chars": len(t["hyp"].strip())}
+                for t in triples]
+        write_json(Path(cfg.bench_dir) / "judge_samples.json", dump)
+        lens = [d["hyp_chars"] for d in dump]
+        log(f"[judge] mean answer length: {round(sum(lens) / max(1, len(lens)))} chars; "
+            f"empty answers: {sum(1 for x in lens if x < 3)}/{len(lens)}")
+        for d in dump[:4]:
+            log(f"  Q: {d['q'][:90]}\n  A: {d['hyp'][:160]!r}")
+    except Exception as e:
+        log(f"[judge] sample dump failed ({e}).", err=True)
+    res = _llm_judge(cfg, triples)
+    res["samples_file"] = str(Path(cfg.bench_dir) / "judge_samples.json")
+    return res
 
 
 def eval_latency(cfg):
