@@ -2034,8 +2034,8 @@ def _build_s2s_manifest(cfg):
         if written + len(buffer) >= target:
             break
         instr, resp = _extract_instruct(ex)
-        if not instr or not resp:
-            continue
+        if not instr or not resp or not _good_response(resp):
+            continue                          # drop generic/self-referential targets
         seen += 1
         if seen <= already:                  # already written on a previous run
             continue
@@ -2112,8 +2112,8 @@ def _build_medical_triples(cfg, gaz, n, use_teacher=False):
         if written + len(buffer) >= n:
             break
         q, a = _extract_medqa(ex)
-        if not q or not a:
-            continue
+        if not q or not a or not _good_response(a):
+            continue                          # drop generic/self-referential targets
         seen += 1
         if seen <= already:
             continue
@@ -2221,6 +2221,32 @@ def _chat_wrap(prompt):
 
 
 # ---- dataset field extractors (robust to schema differences) -------------- #
+
+import re as _re_mod
+# Self-referential / generic-assistant responses POISON a speech-conditioned model:
+# because they don't depend on the question, the model can minimise loss by learning
+# the marginal p(response) and IGNORING the audio (observed: every answer became
+# "...uzmanlık alanım bilgisayar bilimi..." regardless of the question). Drop them so
+# every training target actually depends on its question.
+_RESP_POISON = _re_mod.compile(
+    r"uzmanl[ıi]k alan[ıi]m|bilgisayar bilimi|yaz[ıi]l[ıi]m geli[şs]tir|yapay zek[aâ]|"
+    r"dil modeli|bir asistan|asistan olarak|model olarak|bir yapay|"
+    r"openai|chatgpt|gpt-[0-9]|dil modeliyim|yardımcı olamam", _re_mod.I)
+
+
+def _good_response(text):
+    """Reject training targets that don't depend on the question (generic AI/assistant
+    self-intros), or that are too short/degenerate to teach anything."""
+    t = (text or "").strip()
+    if len(t) < 15 or len(t) > 4000:
+        return False
+    if _RESP_POISON.search(t):
+        return False
+    words = t.split()                                   # kill degenerate repetition
+    if len(words) >= 8 and len(set(w.lower() for w in words)) <= max(3, len(words) // 6):
+        return False
+    return True
+
 
 def _extract_instruct(ex):
     # case-insensitive view so schemas like InstrucTurca's 'Input'/'Output' match
@@ -3492,14 +3518,34 @@ def cmd_tokenizer_audit(args):
     log("=== TOKENIZER AUDIT ===")
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(CFG.student_llm)
-    fert = eval_fertility(CFG)
-    log("fertility:\n" + json.dumps(fert, ensure_ascii=False, indent=2))
     k = args.k or (CFG.vocab_ext_k if CFG.vocab_ext_k > 0 else 3000)
     cands = _mine_vocab_candidates(CFG, tok, k)
     write_json(Path(CFG.work) / "vocab_ext.json", cands)
     log(f"Mined {len(cands)} candidate tokens -> {Path(CFG.work) / 'vocab_ext.json'}")
-    log(f"To TRAIN with the extended vocab, set TMV_VOCAB_EXT={k} and run the stages "
-        "(it applies from stage `align` onward; the extended tokenizer ships with the adapter).")
+    # Build a PROPOSED extended tokenizer (bare + leading-space forms, identical to
+    # what _extend_vocab does at train time) and measure the fertility win NOW,
+    # without training — so the audit actually proves drugs go from ~4 tokens toward 1-2.
+    forms = []
+    for w in cands:
+        for f in (w, " " + w):
+            if f not in forms:
+                forms.append(f)
+    ext = AutoTokenizer.from_pretrained(CFG.student_llm)
+    added = ext.add_tokens(forms)
+    drugs = sorted({s for _k, v in DRUG_PRONUNCIATION.items() for s in (_k, v)})
+
+    def _prof(t):
+        single = sum(1 for d in drugs if len(t(d, add_special_tokens=False).input_ids) == 1)
+        return {"medical": _fertility(t, _MED_FERTILITY_TEXTS), "drug": _fertility(t, drugs),
+                "drug_single_token_pct": round(100 * single / max(1, len(drugs)), 1),
+                "vocab": len(t)}
+    b, e = _prof(tok), _prof(ext)
+    imp = round(100 * (b["drug"] - e["drug"]) / max(1e-6, b["drug"]), 1)
+    log("base vs PROPOSED extended (+%d tokens, incl. leading-space forms):\n%s" % (
+        added, json.dumps({"base": b, "extended": e,
+                           "drug_fertility_improvement_pct": imp}, ensure_ascii=False, indent=2)))
+    log(f"To TRAIN with it, set TMV_VOCAB_EXT={k} and run the stages "
+        "(applies from `align` onward; the extended tokenizer ships with the adapter).")
     log("=== TOKENIZER AUDIT DONE ===")
 
 
