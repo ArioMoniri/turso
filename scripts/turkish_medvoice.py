@@ -255,7 +255,10 @@ class Config:
     bench_limit:     int = int(_env("TMV_BENCH_LIMIT", "200"))
     bench_bootstrap: int = int(_env("TMV_BENCH_BOOT", "1000")) # CI resamples
     bench_judge:     bool = _env("TMV_BENCH_JUDGE", "0") == "1"
-    judge_llm:       str = _env("TMV_JUDGE", "Qwen/Qwen2.5-72B-Instruct-AWQ")  # local judge
+    # Non-AWQ so the vLLM-free judge (transformers + bnb-4bit) works out of the box:
+    # 32B 4-bit ~18GB fits the free slice and is a stronger judge than the 7B student.
+    # Lighter option: TMV_JUDGE=Qwen/Qwen2.5-14B-Instruct. AWQ ids need vLLM/autoawq.
+    judge_llm:       str = _env("TMV_JUDGE", "Qwen/Qwen2.5-32B-Instruct")  # local judge
     preset:          str = _env("TMV_PRESET", "standard")      # smoke|standard|hardcore
 
     # ---- speech adapter architecture ---------------------------------------
@@ -3922,22 +3925,60 @@ def _llm_judge(cfg, triples):
     median over k=3, strict-JSON parse with regex fallback."""
     if not triples:
         return {"error": "no items to judge"}
+    import json as _j
+    import re
+    import statistics
+    # Two backends. vLLM is fast but we do NOT install it (it drags torch cu130 that
+    # breaks the cu128 training venv), so the transformers + bitsandbytes 4-bit path
+    # is the default that works with the ALREADY-installed stack. For it, use a
+    # NON-AWQ judge (e.g. TMV_JUDGE=Qwen/Qwen2.5-32B-Instruct) — it 4-bit-quantizes
+    # on the fly and fits the free slice; an AWQ id needs autoawq/vLLM.
+    gen_fn = None
+    backend = None
     try:
         from vllm import LLM, SamplingParams
         judge = LLM(model=cfg.judge_llm, gpu_memory_utilization=0.85,
                     max_model_len=4096, trust_remote_code=True)
         sp = SamplingParams(temperature=0.3, top_p=0.9, max_tokens=200, n=3)
-    except Exception as e:
-        return {"error": f"judge model unavailable ({e})"}
-    import json as _j
-    import re
-    import statistics
+
+        def gen_fn(prompt):
+            return [o.text for o in judge.generate([prompt], sp)[0].outputs]
+        backend = "vllm"
+    except Exception as e_v:
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+            jt = AutoTokenizer.from_pretrained(cfg.judge_llm)
+            q4 = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                    bnb_4bit_compute_dtype=torch.bfloat16)
+            jm = AutoModelForCausalLM.from_pretrained(
+                cfg.judge_llm, quantization_config=q4, device_map={"": 0},
+                trust_remote_code=True)
+            jm.eval()
+
+            def gen_fn(prompt, _jt=jt, _jm=jm):
+                ids = _jt(prompt, return_tensors="pt").to(_jm.device)
+                outs = []
+                with torch.no_grad():
+                    for _ in range(3):     # self-consistency k=3
+                        g = _jm.generate(**ids, max_new_tokens=200, do_sample=True,
+                                         temperature=0.3, top_p=0.9,
+                                         pad_token_id=(_jt.pad_token_id or _jt.eos_token_id))
+                        outs.append(_jt.decode(g[0][ids.input_ids.shape[1]:],
+                                               skip_special_tokens=True))
+                return outs
+            backend = "transformers-4bit"
+        except Exception as e_t:
+            return {"error": f"judge unavailable (vllm: {str(e_v)[:50]}; "
+                             f"transformers: {str(e_t)[:90]}). For the vLLM-free path set "
+                             f"TMV_JUDGE to a non-AWQ instruct model."}
+    log(f"[judge] backend={backend} model={cfg.judge_llm}")
     axes = ["correctness", "safety", "completeness", "fluency"]
     agg = {a: [] for a in axes}
     for it in triples:
         prompt = _chat_wrap(_judge_prompt(it.get("q", ""), it.get("gold", ""), it.get("hyp", "")))
         try:
-            cands = [o.text for o in judge.generate([prompt], sp)[0].outputs]
+            cands = gen_fn(prompt)
         except Exception:
             continue
         per = {a: [] for a in axes}
@@ -3957,6 +3998,7 @@ def _llm_judge(cfg, triples):
                 agg[a].append(statistics.median(per[a]))
     out = {a: (round(sum(v) / len(v), 3) if v else None) for a, v in agg.items()}
     out["n"] = len(triples)
+    out["backend"] = backend
     return out
 
 
