@@ -3772,17 +3772,21 @@ def eval_s2s(cfg, limit=100):
     if not items:
         return {"error": "no spoken-QA eval items (need TTS to render questions)"}
     out = {}
-    # native model
+    # native model. Report token-overlap F1 (meaningful for free-form QA) alongside
+    # the strict whole-reference-substring acc, which is ~0 by construction and kept
+    # only for continuity. Real correctness is the LLM-judge suite (TMV_BENCH_JUDGE=1).
     try:
         model, tok, feat = build_model(cfg, for_training=False,
                                        adapter_dir=cfg.stage_ckpt("medical"))
-        correct = 0
+        correct = 0; f1s = []
         for it in items:
             gen = model.generate_ids(it["wav"], it.get("prompt", ""), max_new_tokens=64)
             ans = tok.decode(gen[0], skip_special_tokens=True)
-            if _match(ans, it["answer"]):
-                correct += 1
-        out["native (ours)"] = {"acc": round(correct / len(items), 4), "n": len(items)}
+            correct += int(_match(ans, it["answer"]))
+            f1s.append(_token_f1(ans, it["answer"]))
+        out["native (ours)"] = {"exact_contains_acc": round(correct / len(items), 4),
+                                "token_f1": round(sum(f1s) / len(f1s), 4), "n": len(items),
+                                "note": "token_f1 is overlap, not correctness; use judge"}
         del model, tok, feat        # free the native 7B before loading the cascade 7B
     except Exception as e:
         out["native (ours)"] = {"error": str(e)}
@@ -4133,7 +4137,7 @@ def _eval_cascade_qa(cfg, items):
     tok = AutoTokenizer.from_pretrained(cfg.student_llm)
     mdl = AutoModelForCausalLM.from_pretrained(cfg.student_llm, torch_dtype=torch.bfloat16,
                                                device_map={"": 0})
-    correct = 0
+    correct = 0; f1s = []
     for it in items:
         q = asr.transcribe(it["wav"], 16000, "tr")
         msgs = [{"role": "user", "content": q}]
@@ -4141,7 +4145,9 @@ def _eval_cascade_qa(cfg, items):
         gen = mdl.generate(ids, max_new_tokens=64, do_sample=False)
         ans = tok.decode(gen[0][ids.shape[1]:], skip_special_tokens=True)
         correct += int(_match(ans, it["answer"]))
-    res = {"acc": round(correct / len(items), 4), "n": len(items)}
+        f1s.append(_token_f1(ans, it["answer"]))
+    res = {"exact_contains_acc": round(correct / len(items), 4),
+           "token_f1": round(sum(f1s) / len(f1s), 4) if f1s else 0.0, "n": len(items)}
     del asr, mdl, tok
     _free_gpu()
     return res
@@ -4149,6 +4155,24 @@ def _eval_cascade_qa(cfg, items):
 
 def _match(hyp, ref):
     return normalize_tr(ref) in normalize_tr(hyp)
+
+
+def _token_f1(hyp, ref):
+    """Token-overlap F1 between answer and reference (order-free bag-of-words on
+    normalized Turkish). A meaningful score for free-form QA where the strict
+    whole-reference substring match (_match) is ~0 by construction. NOT a
+    correctness score — the LLM-judge suite is the real correctness signal."""
+    h = normalize_tr(hyp).split()
+    r = normalize_tr(ref).split()
+    if not h or not r:
+        return 0.0
+    from collections import Counter
+    ch, cr = Counter(h), Counter(r)
+    overlap = sum((ch & cr).values())
+    if overlap == 0:
+        return 0.0
+    prec, rec = overlap / len(h), overlap / len(r)
+    return round(2 * prec * rec / (prec + rec), 4)
 
 
 def _mos_score(wavs, srs):
