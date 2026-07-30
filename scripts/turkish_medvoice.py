@@ -188,7 +188,7 @@ class Config:
     # ---- student / teacher / eval models ----------------------------------
     student_llm: str = _env("TMV_STUDENT", "Qwen/Qwen2.5-7B-Instruct")   # Apache-2.0
     teacher_llm: str = _env("TMV_TEACHER", "cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit")
-    text_teacher_fallback: str = _env("TMV_TEACHER_TXT", "Qwen/Qwen2.5-7B-Instruct")
+    text_teacher_fallback: str = _env("TMV_TEACHER_TXT", "Qwen/Qwen2.5-14B-Instruct")  # 4-bit fits
     eval_asr:    str = _env("TMV_EVAL_ASR", "openai/whisper-large-v3")    # neutral round-trip ASR
     eval_judge:  str = _env("TMV_EVAL_JUDGE", "Qwen/Qwen2.5-72B-Instruct-AWQ")  # optional local judge
     spk_sim:     str = _env("TMV_SPK_SIM", "speechbrain/spkrec-ecapa-voxceleb")
@@ -2194,22 +2194,28 @@ def _load_text_generator(cfg):
             return _gen
         except Exception as e:
             log(f"  vLLM load of {model_id} failed ({e}).", err=True)
-    # transformers fallback (text model only)
+    # transformers + bnb-4bit fallback (no vLLM): 4-bit lets a strong 14B/32B teacher
+    # fit the free slice, so KD targets are high quality — the point of the teacher.
     try:
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
         mid = cfg.text_teacher_fallback
-        log(f"  loading text-fallback teacher via transformers: {mid}")
+        log(f"  loading text-fallback teacher via transformers+4bit: {mid}")
         tok = AutoTokenizer.from_pretrained(mid)
+        q4 = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                bnb_4bit_compute_dtype=torch.bfloat16)
         mdl = AutoModelForCausalLM.from_pretrained(
-            mid, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
+            mid, quantization_config=q4, device_map={"": 0}, trust_remote_code=True)
+        mdl.eval()
 
         def _gen(prompt, _t=tok, _m=mdl):
             msgs = [{"role": "user", "content": prompt}]
             ids = _t.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt").to(_m.device)
-            out = _m.generate(ids, max_new_tokens=512, do_sample=True, temperature=0.7, top_p=0.9)
+            with torch.no_grad():
+                out = _m.generate(ids, max_new_tokens=512, do_sample=True, temperature=0.7,
+                                  top_p=0.9, pad_token_id=(_t.pad_token_id or _t.eos_token_id))
             return _t.decode(out[0][ids.shape[1]:], skip_special_tokens=True).strip()
-        log(f"  ACTIVE teacher = {mid} (transformers)")
+        log(f"  ACTIVE teacher = {mid} (transformers+4bit)")
         return _gen
     except Exception as e:
         log(f"  transformers teacher unavailable ({e}).", err=True)
@@ -2231,7 +2237,10 @@ import re as _re_mod
 _RESP_POISON = _re_mod.compile(
     r"uzmanl[ıi]k alan[ıi]m|bilgisayar bilimi|yaz[ıi]l[ıi]m geli[şs]tir|yapay zek[aâ]|"
     r"dil modeli|bir asistan|asistan olarak|model olarak|bir yapay|"
-    r"openai|chatgpt|gpt-[0-9]|dil modeliyim|yardımcı olamam", _re_mod.I)
+    r"openai|chatgpt|gpt-[0-9]|dil modeliyim|yardımcı olamam|"
+    # dataset boilerplate that leaked as 'answers' (kayrab): drop it too
+    r"chatbot|veri seti|veri kümesi|eğitimi için|eğitim veri|bu bir örnek|"
+    r"doktor-hasta veri|placeholder|lorem ipsum|vereceği bir yanıt", _re_mod.I)
 
 
 def _good_response(text):
@@ -4772,7 +4781,8 @@ def cmd_auto(args):
         if step == "doctor":
             return bool(cmd_doctor(_ap.Namespace()))
         if step == "data":
-            cmd_data(_ap.Namespace(only=None, n_medical=None, use_teacher=args.use_teacher))
+            _use_teacher = args.use_teacher or os.environ.get("TMV_USE_TEACHER", "0") == "1"
+            cmd_data(_ap.Namespace(only=None, n_medical=None, use_teacher=_use_teacher))
             counts = {m: _manifest_count(Path(CFG.data_dir) / f"{m}.jsonl")
                       for m in ("align", "s2s", "medical")}
             fracs = {m: _audio_frac(Path(CFG.data_dir) / f"{m}.jsonl")
