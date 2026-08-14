@@ -79,6 +79,7 @@ class Config:
     depth_layers: int = int(_env("CWM_DEPTH", "6"))
     jepa_ctx_layers: int = int(_env("CWM_JEPA_CTX", "12"))
     jepa_pred_layers: int = int(_env("CWM_JEPA_PRED", "3"))
+    jepa_lat_dim: int = int(_env("CWM_JEPA_LAT", "128"))   # JEPA target-space dim
     seq_len: int = int(_env("CWM_SEQ", "4096"))
     rope_theta: float = 1e4
     rms_eps: float = 1e-5
@@ -337,9 +338,13 @@ def _reexec(extra_env=None):
         return False
     env["CWM_HEAL_N"] = str(n)
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    argv = [sys.executable] + sys.argv
-    if "--resume" not in argv:
-        argv.append("--resume")
+    # --resume is a TOP-LEVEL flag: it must sit BEFORE the subcommand token, else
+    # the subparser rejects it and the re-exec'd process dies at argparse (exit 2),
+    # which would silently defeat the entire self-heal/OOM-ladder/resume mechanism.
+    rest = sys.argv[1:]
+    if "--resume" not in rest:
+        rest = ["--resume"] + rest
+    argv = [sys.executable, sys.argv[0]] + rest
     log(f"[heal] re-exec #{n}/{MAX_HEAL}: {' '.join(argv[1:])}", err=True)
     runlog({"event": "reexec", "n": n})
     try:
@@ -386,30 +391,61 @@ def supervise(fn):
 # =========================================================================== #
 class MimiWrap:
     def __init__(self, cfg=CFG):
-        self.cfg = cfg; self._m = None; self.sr = 24000
+        self.cfg = cfg; self._m = None; self.sr = 24000; self._proj = None
 
     def load(self):
         if self._m is not None:
             return self._m
         import torch
         from moshi.models import loaders
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
         log(f"[mimi] loading {self.cfg.mimi_repo} ...")
-        ckpt = loaders.CheckpointInfo.from_hf_repo(self.cfg.mimi_repo)
-        m = ckpt.get_mimi(device="cuda" if torch.cuda.is_available() else "cpu")
-        m.set_num_codebooks(self.cfg.n_codebooks)
+        m = None; errs = []
+        # moshi has had two loader entry points across versions — try both so we
+        # don't hard-depend on one API that may not match the installed package.
+        try:
+            ci = loaders.CheckpointInfo.from_hf_repo(self.cfg.mimi_repo)
+            m = ci.get_mimi(device=dev)
+        except Exception as e:
+            errs.append(f"CheckpointInfo.from_hf_repo: {e}")
+        if m is None:
+            try:
+                from huggingface_hub import hf_hub_download
+                w = hf_hub_download(self.cfg.mimi_repo, loaders.MIMI_NAME)
+                m = loaders.get_mimi(w, device=dev)
+            except Exception as e:
+                errs.append(f"get_mimi(hf_hub_download): {e}")
+        if m is None:
+            raise RuntimeError("Mimi load failed via both moshi entry points: "
+                               + " | ".join(errs))
+        try:
+            m.set_num_codebooks(self.cfg.n_codebooks)
+        except Exception as e:
+            log(f"[mimi] set_num_codebooks failed ({e}); using default.", err=True)
         for p in m.parameters():
             p.requires_grad_(False)
         m.eval()
-        self._m = m; self.sr = m.sample_rate
+        self._m = m; self.sr = int(getattr(m, "sample_rate", 24000))
         return m
 
     @property
     def embed_dim(self):
-        # continuous latent dim used for JEPA targets
-        return getattr(self.load(), "dimension", 512)
+        return self.cfg.jepa_lat_dim
+
+    def _projection(self):
+        """Fixed, seeded [codebook_size, jepa_lat_dim] matrix that maps a frozen
+        semantic token to a stable continuous vector. Deterministic across runs
+        and shards so the JEPA target space never changes dimension mid-training."""
+        import numpy as np
+        if self._proj is None:
+            rng = np.random.default_rng(self.cfg.seed)
+            P = rng.standard_normal((self.cfg.codebook_size, self.cfg.jepa_lat_dim))
+            P /= (np.linalg.norm(P, axis=1, keepdims=True) + 1e-6)
+            self._proj = P.astype("float16")
+        return self._proj
 
     def encode(self, wav16k_or_24k, in_sr):
-        """wav (1D float32) -> Mimi codes int[n_codebooks, T]."""
+        """wav (1D float32) -> Mimi codes int16[n_codebooks, T]."""
         import torch
         import numpy as np
         m = self.load()
@@ -422,23 +458,13 @@ class MimiWrap:
             codes = m.encode(t)               # [1, K, T]
         return codes[0].to("cpu").numpy().astype("int16")
 
-    def encode_latents(self, wav, in_sr):
-        """Return the continuous pre-quant latent [D, T] for JEPA targets."""
-        import torch
+    def semantic_latent(self, codes):
+        """JEPA target [D, T]: fixed projection of the frozen semantic codes
+        (codebook 0). Depends only on the documented encode() path."""
         import numpy as np
-        m = self.load()
-        x = np.asarray(wav, dtype="float32").reshape(-1)
-        if in_sr != self.sr:
-            import librosa
-            x = librosa.resample(x, orig_sr=in_sr, target_sr=self.sr)
-        t = torch.tensor(x).view(1, 1, -1).to(next(m.parameters()).device)
-        with torch.no_grad():
-            emb = m.encode_to_latent(t) if hasattr(m, "encode_to_latent") else None
-        if emb is None:                       # fallback: embed the codes
-            with torch.no_grad():
-                codes = m.encode(t)
-                emb = m.decode_latent(codes) if hasattr(m, "decode_latent") else codes.float()
-        return emb[0].to("cpu").numpy().astype("float16")
+        P = self._projection()
+        sem = np.asarray(codes)[0].astype("int64") % self.cfg.codebook_size
+        return P[sem].T.astype("float16")     # [D, T]
 
     def decode(self, codes):
         import torch
@@ -534,17 +560,19 @@ def build_text_shards(cfg=CFG, target_tokens=None):
     sp = load_tokenizer(cfg)
     target = target_tokens or cfg.target_text_tokens
     man_path = Path(cfg.shard_dir) / "text_manifest.json"
-    man = read_json(man_path, {"tokens": 0, "shards": []}) or {"tokens": 0, "shards": []}
+    man = read_json(man_path, None) or {"tokens": 0, "shards": [], "consumed": 0}
+    man.setdefault("consumed", 0)
     if man["tokens"] >= target:
         log(f"[data] text shards done ({man['tokens']} tokens)."); return
     # dynamic disk cap
     free = disk_free_gb(cfg.data_dir)
     cap_tokens = int(max(0, free - cfg.disk_reserve_gb) * 1e9 / 2)  # uint16=2B/token
     target = min(target, man["tokens"] + cap_tokens)
-    log(f"[data] building text shards up to {target} tokens (free {free:.0f}GB) ...")
+    log(f"[data] building text shards up to {target} tokens (free {free:.0f}GB, "
+        f"resume-skip {man['consumed']} docs) ...")
     from datasets import load_dataset
     eos = sp.eos_id()
-    buf = []; sidx = len(man["shards"])
+    buf = []; sidx = len(man["shards"]); seen = 0
     SHARD = 2_000_000  # tokens/shard (~4MB)
     try:
         ds = load_dataset(cfg.text_datasets[0], "tur_Latn", split="train",
@@ -552,6 +580,10 @@ def build_text_shards(cfg=CFG, target_tokens=None):
         for ex in ds:
             if man["tokens"] >= target:
                 break
+            seen += 1
+            if seen <= man["consumed"]:       # exact cursor: already packed
+                continue
+            man["consumed"] = seen
             ids = sp.encode(str(ex.get("text", ""))) + [eos]
             buf.extend(ids)
             if len(buf) >= SHARD:
@@ -574,18 +606,19 @@ def build_audio_shards(cfg=CFG, target_hours=None):
     import numpy as np
     target_h = target_hours or cfg.target_audio_hours
     man_path = Path(cfg.shard_dir) / "audio_manifest.json"
-    man = read_json(man_path, {"hours": 0.0, "shards": []}) or {"hours": 0.0, "shards": []}
+    man = read_json(man_path, None) or {"hours": 0.0, "shards": [], "consumed": 0}
+    man.setdefault("consumed", 0)
     if man["hours"] >= target_h:
         log(f"[data] audio shards done ({man['hours']:.1f} h)."); return
     free = disk_free_gb(cfg.data_dir)
     # Mimi codes ~ 8 codebooks * 12.5 Hz * 2B = 200 B/s -> 0.72 MB/h (+ latents)
     cap_h = int(max(0, free - cfg.disk_reserve_gb) * 1e9 / (5 * 1024 * 1024))
     target_h = min(target_h, man["hours"] + cap_h)
-    log(f"[data] Mimi-encoding audio up to {target_h} h (free {free:.0f}GB) ...")
+    log(f"[data] Mimi-encoding audio up to {target_h} h (free {free:.0f}GB, "
+        f"resume-skip {man['consumed']} clips) ...")
     mimi = MimiWrap(cfg)
     from datasets import load_dataset, Audio
     sidx = len(man["shards"]); seen = 0
-    already = int(man["hours"] * 3600 / 8)  # ~8s/clip rough resume cursor
     try:
         ds = load_dataset(cfg.audio_datasets[0], "tr", split="train",
                           streaming=True, cache_dir=cfg.hf_cache)
@@ -597,14 +630,15 @@ def build_audio_shards(cfg=CFG, target_hours=None):
             if man["hours"] >= target_h:
                 break
             seen += 1
-            if seen <= already:
+            if seen <= man["consumed"]:       # exact cursor: already processed
                 continue
+            man["consumed"] = seen            # count it as consumed even if skipped
             wav, sr = _decode_audio(ex.get("audio"))
             if wav is None or len(wav) < sr * 0.5:
                 continue
             try:
                 codes = mimi.encode(wav, sr)               # [K, T]
-                lat = mimi.encode_latents(wav, sr)         # [D, T] for JEPA
+                lat = mimi.semantic_latent(codes)          # [D, T] JEPA target
             except Exception as e:
                 log(f"[data] encode skip ({e}).", err=True); continue
             fp = Path(cfg.shard_dir) / f"audio_{sidx:07d}.npz"
@@ -668,7 +702,9 @@ def _build_modules(cfg):
         freqs = 1.0 / (theta ** (torch.arange(0, half, device=x.device).float() / half))
         t = torch.arange(T, device=x.device).float()
         ang = torch.outer(t, freqs)                       # [T, half]
-        cos, sin = ang.cos()[None, None], ang.sin()[None, None]
+        # keep rotary math in x.dtype so bf16 q/k stay bf16 (else SDPA sees
+        # fp32 q/k vs bf16 v and raises a dtype-mismatch on the first GPU forward)
+        cos = ang.cos()[None, None].to(x.dtype); sin = ang.sin()[None, None].to(x.dtype)
         x1, x2 = x[..., :half], x[..., half:]
         return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
@@ -795,7 +831,10 @@ def _build_modules(cfg):
                 pt.mul_(m).add_(ps, alpha=1 - m)
 
         def forward(self, lat):
-            # lat: [B, T, in_dim] user-stream continuous latents
+            # lat: [B, T, in_dim] user-stream continuous latents.
+            # Match the module's own (bf16 on GPU) dtype — the latents arrive as
+            # fp32 from numpy, and the Linear would otherwise dtype-mismatch.
+            lat = lat.to(self.inp.weight.dtype)
             c = self.inp(lat)
             for b in self.ctx: c = b(c, causal=True)
             with torch.no_grad():
@@ -818,7 +857,8 @@ def _build_modules(cfg):
             super().__init__()
             self.adapter = nn.Linear(cfg.d_model, cfg.d_model)
         def forward(self, hidden):
-            # hidden: [B,T,d]; predict future hidden from adapted current
+            # hidden: [B,T,d]; predict future hidden from adapted current.
+            hidden = hidden.to(self.adapter.weight.dtype)
             r = self.adapter(hidden[:, :-4])
             return F.smooth_l1_loss(r, hidden[:, 4:].detach())
 
@@ -974,7 +1014,7 @@ def train_stage(cfg, stage, resume=False, max_seconds=None):
     import numpy as np
     set_seed(cfg.seed)
     flags = _stage_flags(stage)
-    jepa_in = _infer_jepa_dim(cfg, 512) if flags["audio"] else 512
+    jepa_in = _infer_jepa_dim(cfg, cfg.jepa_lat_dim) if flags["audio"] else cfg.jepa_lat_dim
     model = build_model(cfg, jepa_in)
     decay = [p for p in model.parameters() if p.requires_grad and p.ndim >= 2]
     nodecay = [p for p in model.parameters() if p.requires_grad and p.ndim < 2]
@@ -996,7 +1036,10 @@ def train_stage(cfg, stage, resume=False, max_seconds=None):
     agen = _audio_batches(cfg, cfg.micro_batch) if flags["audio"] else None
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     warm_aux = int(cfg.aux_warmup_frac * cfg.total_steps)
-    t0 = time.time(); last_save = time.time(); micro = 0
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    # per-stage tokens/step for an honest MFU (audio stages run 256 frames, not seq_len)
+    stage_tok = cfg.seq_len if flags["text"] else 256
+    t0 = time.time(); last_save = time.time(); micro = 0; nonfinite_window = False
     opt.zero_grad(set_to_none=True)
     log(f"=== TRAIN stage={stage} flags={flags} from step {step} ===")
     runlog({"event": "train_start", "stage": stage, "step": step,
@@ -1028,7 +1071,7 @@ def train_stage(cfg, stage, resume=False, max_seconds=None):
                 # depth: acoustic codebooks 1..7 at each frame
                 ac = torch.tensor(np.stack([c[1:, :T] for c in cb]).astype("int64"),
                                   device=dev).permute(0, 2, 1).reshape(-1, cfg.n_codebooks - 1)
-                dlog = model.depth(h.reshape(-1, cfg.d_model).float().to(h.dtype), ac)
+                dlog = model.depth(h.reshape(-1, cfg.d_model), ac)
                 ld = sum(torch.nn.functional.cross_entropy(dlog[k].float(), ac[:, k])
                          for k in range(cfg.n_codebooks - 1)) / (cfg.n_codebooks - 1)
                 loss = loss + cfg.lambda_audio * (la + ld)
@@ -1039,26 +1082,32 @@ def train_stage(cfg, stage, resume=False, max_seconds=None):
                                      device=dev)   # [B,T,D]
                     lj, jstd = model.jepa(L)
                     loss = loss + cfg.lambda_jepa * lj
-                    parts["jepa"] = float(lj); parts["jepa_std"] = round(jstd, 3)
+                    parts["jepa"] = float(lj.detach()); parts["jepa_std"] = round(jstd, 3)
                     if jstd < 0.05:
                         alert(f"JEPA latent std low ({jstd:.3f}) -> collapse risk")
                 if flags["rollout"] and aux_on:
-                    lr_ = model.rollout(h.float())
+                    lr_ = model.rollout(h)
                     loss = loss + cfg.lambda_rollout * lr_
-                    parts["rollout"] = float(lr_)
+                    parts["rollout"] = float(lr_.detach())
         except StopIteration:
             log("[data] exhausted a stream; recreating iterators.")
             tgen = _text_batches(cfg, cfg.micro_batch, cfg.seq_len) if flags["text"] else None
             agen = _audio_batches(cfg, cfg.micro_batch) if flags["audio"] else None
             continue
 
-        (loss / cfg.grad_accum).backward()
+        # accumulate only finite micro-losses; a single bad micro-batch marks the
+        # whole window so we skip the optimizer step rather than apply poison grads
+        if torch.isfinite(loss):
+            (loss / cfg.grad_accum).backward()
+        else:
+            nonfinite_window = True
+            alert("non-finite micro-loss -> dropped from this accumulation window")
         micro += 1
         if micro % cfg.grad_accum == 0:
-            if not torch.isfinite(loss):
-                alert("non-finite loss -> skip step, zero grad"); opt.zero_grad(set_to_none=True); continue
-            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad],
-                                           cfg.max_grad_norm)
+            gnorm = torch.nn.utils.clip_grad_norm_(trainable, cfg.max_grad_norm)
+            if nonfinite_window or not torch.isfinite(gnorm):
+                alert(f"non-finite in accumulation window (gnorm={float(gnorm):.3g}) -> skip step")
+                opt.zero_grad(set_to_none=True); nonfinite_window = False; continue
             opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
             if flags["jepa"]:
                 m = cfg.ema_final - (cfg.ema_final - cfg.ema_base) * max(0.0, 1 - step / cfg.total_steps)
@@ -1071,7 +1120,7 @@ def train_stage(cfg, stage, resume=False, max_seconds=None):
             if step % cfg.log_steps == 0:
                 used, tot = vram_used_total()
                 its = (step) / max(1e-6, time.time() - t0)
-                mfu = _mfu(cfg, its)
+                mfu = _mfu(cfg, its, stage_tok)
                 log(f"stage={stage} step={step}/{cfg.total_steps} loss={loss.item():.4f} "
                     f"lr={sched.get_last_lr()[0]:.2e} vram={used:.1f}/{tot:.1f} {its:.3f}it/s mfu={mfu:.2f} "
                     + " ".join(f"{k}={v}" for k, v in parts.items()))
@@ -1090,11 +1139,14 @@ def train_stage(cfg, stage, resume=False, max_seconds=None):
     return "done"
 
 
-def _mfu(cfg, its):
-    # rough model-flops-util vs ~150 TFLOPS sustained on the MIG
+def _mfu(cfg, its, tokens_per_seq=None):
+    # rough model-flops-util vs ~150 TFLOPS sustained on the MIG.
+    # tokens_per_seq defaults to seq_len (text) but audio stages run fewer frames,
+    # so callers pass the real per-sequence length to avoid an inflated MFU.
+    tps = cfg.seq_len if tokens_per_seq is None else tokens_per_seq
     N = cfg.d_model * cfg.d_model * 12 * cfg.n_layers  # crude param proxy
     flops_tok = 6 * N
-    toks = its * cfg.micro_batch * cfg.grad_accum * cfg.seq_len
+    toks = its * cfg.micro_batch * cfg.grad_accum * tps
     return round(flops_tok * toks / 150e12, 3)
 
 
@@ -1170,7 +1222,7 @@ def cmd_bench(cfg=CFG, steps=30):
 def cmd_eval(cfg, stage):
     import torch
     log(f"=== EVAL stage={stage} ===")
-    model = build_model(cfg, _infer_jepa_dim(cfg, 512))
+    model = build_model(cfg, _infer_jepa_dim(cfg, cfg.jepa_lat_dim))
     s, _ = load_ckpt(cfg, stage, model)
     if s == 0:
         log("[eval] no checkpoint; train first.", err=True)
@@ -1209,9 +1261,15 @@ def cmd_auto(cfg, args):
         if done(step):
             log(f"[auto] {step} already done — skip."); continue
         log(f"[auto] >>>>>> {step}")
-        ok = _run_step(cfg, step, args)
-        if ok:
+        res = _run_step(cfg, step, args)
+        if res == "done":
             mark(step)
+        elif res == "pause":
+            # stage checkpointed itself early (timebox / resource-stop) — NOT a
+            # failure and NOT complete. Leave it un-marked and exit cleanly so the
+            # next `auto` run resumes this same stage from its checkpoint.
+            log(f"[auto] step '{step}' PAUSED (checkpointed). Re-run "
+                "`python cwm.py auto` (or run_cwm.sh start) to resume."); return
         else:
             die(f"[auto] step '{step}' did not pass its gate — see REPORT/ALERT. "
                 "Fix the cause, then re-run: python cwm.py auto")
@@ -1219,9 +1277,11 @@ def cmd_auto(cfg, args):
 
 
 def _run_step(cfg, step, args):
-    if step == "setup":   return bool(cmd_setup(cfg))
+    """Returns 'done' (mark + advance) | 'pause' (clean resume-later) | 'fail' (gate)."""
+    if step == "setup":   return "done" if cmd_setup(cfg) else "fail"
     if step == "tokenizer":
-        train_tokenizer(cfg); return Path(cfg.tok_dir, "spm.model").exists()
+        train_tokenizer(cfg)
+        return "done" if Path(cfg.tok_dir, "spm.model").exists() else "fail"
     if step == "data":
         build_text_shards(cfg); build_audio_shards(cfg)
         tm = read_json(Path(cfg.shard_dir) / "text_manifest.json", {"tokens": 0})
@@ -1229,17 +1289,17 @@ def _run_step(cfg, step, args):
         ok = tm.get("tokens", 0) > 1e6 and am.get("hours", 0) > 1.0
         if not ok:
             alert("data step produced too little (network/disk?) — not marking done")
-        return ok
-    if step == "smoke":   return cmd_smoke(cfg)
-    if step == "bench":   return cmd_bench(cfg).get("pass", False)
+        return "done" if ok else "fail"
+    if step == "smoke":   return "done" if cmd_smoke(cfg) else "fail"
+    if step == "bench":   return "done" if cmd_bench(cfg).get("pass", False) else "fail"
     if step.startswith("train:"):
         stage = step.split(":", 1)[1]
-        # first launch of each stage waits for MFU gate already passed; run resumable
         r = train_stage(cfg, stage, resume=True, max_seconds=getattr(args, "max_seconds", None))
-        return Path(cfg.stage_ckpt(stage), "last.pt").exists()
+        # only a true completion advances the roadmap; timebox/stop -> resume later
+        return "done" if r == "done" else "pause"
     if step.startswith("eval:"):
-        cmd_eval(cfg, step.split(":", 1)[1]); return True
-    return True
+        cmd_eval(cfg, step.split(":", 1)[1]); return "done"
+    return "done"
 
 
 # =========================================================================== #
