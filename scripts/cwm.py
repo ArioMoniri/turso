@@ -132,7 +132,7 @@ class Config:
     min_mfu: float = float(_env("CWM_MIN_MFU", "0.20"))
 
     # ---- Mimi / tokenizer ---------------------------------------------------
-    mimi_repo: str = _env("CWM_MIMI", "kyutai/mimi")
+    mimi_repo: str = _env("CWM_MIMI", "kyutai/moshiko-pytorch-bf16")  # hosts moshi-format Mimi
 
     def __post_init__(self):
         for d in (self.data_dir, self.shard_dir, self.ckpt_dir, self.log_dir,
@@ -400,32 +400,44 @@ def supervise(fn):
 class MimiWrap:
     def __init__(self, cfg=CFG):
         self.cfg = cfg; self._m = None; self.sr = 24000; self._proj = None
+        self._load_err = None
 
     def load(self):
         if self._m is not None:
             return self._m
+        if self._load_err is not None:      # don't re-hammer HF on a hard failure
+            raise self._load_err
         import torch
         from moshi.models import loaders
+        from huggingface_hub import hf_hub_download
         dev = "cuda" if torch.cuda.is_available() else "cpu"
-        log(f"[mimi] loading {self.cfg.mimi_repo} ...")
+        tok = _hf_token()
+        # The moshi-format Mimi weight lives in the moshiko repo (DEFAULT_REPO),
+        # NOT kyutai/mimi (that's the transformers-format repo with model.safetensors).
+        name = getattr(loaders, "MIMI_NAME", "tokenizer-e351c8d8-checkpoint125.safetensors")
+        default_repo = getattr(loaders, "DEFAULT_REPO", "kyutai/moshiko-pytorch-bf16")
+        repos = []
+        for r in (self.cfg.mimi_repo, default_repo):
+            if r and r not in repos:
+                repos.append(r)
+        log(f"[mimi] loading moshi-format Mimi ({name}) ...")
         m = None; errs = []
-        # moshi has had two loader entry points across versions — try both so we
-        # don't hard-depend on one API that may not match the installed package.
-        try:
-            ci = loaders.CheckpointInfo.from_hf_repo(self.cfg.mimi_repo)
-            m = ci.get_mimi(device=dev)
-        except Exception as e:
-            errs.append(f"CheckpointInfo.from_hf_repo: {e}")
-        if m is None:
+        for r in repos:
             try:
-                from huggingface_hub import hf_hub_download
-                w = hf_hub_download(self.cfg.mimi_repo, loaders.MIMI_NAME)
-                m = loaders.get_mimi(w, device=dev)
+                w = hf_hub_download(r, name, token=tok) if tok else hf_hub_download(r, name)
+                try:
+                    m = loaders.get_mimi(w, device=dev, num_codebooks=self.cfg.n_codebooks)
+                except TypeError:           # older moshi: no num_codebooks kwarg
+                    m = loaders.get_mimi(w, device=dev)
+                log(f"[mimi] loaded from {r}")
+                break
             except Exception as e:
-                errs.append(f"get_mimi(hf_hub_download): {e}")
+                errs.append(f"{r}: {str(e)[:140]}")
         if m is None:
-            raise RuntimeError("Mimi load failed via both moshi entry points: "
-                               + " | ".join(errs))
+            self._load_err = RuntimeError("Mimi load failed (moshi weight not found). "
+                "The moshi-format weight is in kyutai/moshiko-pytorch-bf16, not "
+                "kyutai/mimi. Tried: " + " | ".join(errs))
+            raise self._load_err
         try:
             m.set_num_codebooks(self.cfg.n_codebooks)
         except Exception as e:
@@ -701,6 +713,10 @@ def build_audio_shards(cfg=CFG, target_hours=None):
     man["source"] = f"{spec['repo']}:{spec['config']}"; text_key = spec.get("text")
     write_json(man_path, man)
     mimi = MimiWrap(cfg)
+    try:                                    # fail fast: load Mimi ONCE up front
+        mimi.load()
+    except Exception as e:
+        alert(f"Mimi codec load failed: {e}"); write_json(man_path, man); return
     sidx = len(man["shards"]); seen = 0
     try:
         for ex in ds:
