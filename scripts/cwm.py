@@ -638,7 +638,7 @@ def _open_audio_stream(cfg, spec):
     clip. Robust to config vs no-config and script-vs-parquet: tries the given
     config and no-config, over the default revision then the parquet-converted
     ref; passes an HF token if present (for gated repos)."""
-    from datasets import load_dataset
+    from datasets import load_dataset, Audio
     tok = _hf_token(); last = None; split = spec.get("split", "train")
     conf = spec.get("config")
     conf_variants = ["default", None] if conf in (None, "", "default") else [conf, None]
@@ -650,6 +650,12 @@ def _open_audio_stream(cfg, spec):
                 if rev: kw["revision"] = rev
                 if tok: kw["token"] = tok
                 ds = load_dataset(*pos, **kw)
+                # datasets v4+ decodes audio via torchcodec+ffmpeg; avoid that dep
+                # entirely by taking RAW bytes and decoding them ourselves.
+                try:
+                    ds = ds.cast_column("audio", Audio(decode=False))
+                except Exception:
+                    pass
                 ex = next(iter(ds))                 # probe: must exist AND decode
                 wav, sr = _decode_audio(ex.get("audio"))
                 if wav is not None and len(wav) > 0:
@@ -729,24 +735,40 @@ def build_audio_shards(cfg=CFG, target_hours=None):
     log(f"[data] audio shards: {man['hours']:.1f} h in {len(man['shards'])} clips.")
 
 
-def _decode_audio(field):
+def _sf_or_librosa(src):
+    """Decode a file/BytesIO to (mono float32, sr). soundfile first (wav/flac and,
+    with a modern libsndfile, mp3); librosa/audioread fallback for mp3 if not."""
     import io
     import numpy as np
     import soundfile as sf
+    try:
+        a, sr = sf.read(src, dtype="float32")
+        return (a.mean(1) if a.ndim > 1 else a), sr
+    except Exception:
+        try:
+            import librosa
+            if isinstance(src, io.BytesIO):
+                src.seek(0)
+            a, sr = librosa.load(src, sr=None, mono=True)
+            return np.asarray(a, dtype="float32"), sr
+        except Exception:
+            return None, 0
+
+
+def _decode_audio(field):
+    import io
+    import numpy as np
     if field is None:
         return None, 0
     try:
         if isinstance(field, dict):
-            if field.get("array") is not None:
+            if field.get("array") is not None:      # already-decoded array
                 a = np.asarray(field["array"], dtype="float32")
                 return (a.mean(1) if a.ndim > 1 else a), int(field.get("sampling_rate", 16000))
-            raw = field.get("bytes")
-            if raw:
-                a, sr = sf.read(io.BytesIO(raw), dtype="float32")
-                return (a.mean(1) if a.ndim > 1 else a), sr
+            if field.get("bytes"):
+                return _sf_or_librosa(io.BytesIO(field["bytes"]))
             if field.get("path"):
-                a, sr = sf.read(field["path"], dtype="float32")
-                return (a.mean(1) if a.ndim > 1 else a), sr
+                return _sf_or_librosa(field["path"])
     except Exception:
         return None, 0
     return None, 0
