@@ -114,7 +114,7 @@ class Config:
     # fall back to gated CV (needs HF_TOKEN + accepted terms). Override with
     # CWM_AUDIO_SPECS="repo:config:textcol,repo:config:textcol".
     audio_specs: str = _env("CWM_AUDIO_SPECS",
-        "ysdede/commonvoice_17_tr_fixed:train:transcription"   # native parquet, ungated, TR
+        "ysdede/commonvoice_17_tr_fixed:default:transcription"  # native parquet, ungated, TR
         ",google/fleurs:tr_tr:transcription"                    # parquet fallback (~10h)
         ",mozilla-foundation/common_voice_17_0:tr:sentence")    # gated: needs HF_TOKEN
     target_audio_hours: int = int(_env("CWM_AUDIO_H", "2000"))
@@ -614,13 +614,15 @@ def _hf_token():
 
 
 def _audio_specs(cfg):
+    # format: repo[:config[:textcol[:split]]]   (config 'default'/'' -> no-config)
     specs = []
     for tok in cfg.audio_specs.split(","):
         p = tok.strip().split(":")
         if not p or not p[0]:
             continue
-        specs.append({"repo": p[0], "config": p[1] if len(p) > 1 else "tr",
-                      "text": p[2] if len(p) > 2 else None})
+        specs.append({"repo": p[0], "config": p[1] if len(p) > 1 else "default",
+                      "text": p[2] if len(p) > 2 else None,
+                      "split": p[3] if len(p) > 3 else "train"})
     return specs
 
 
@@ -632,27 +634,32 @@ def _text_of(ex, key):
 
 
 def _open_audio_stream(cfg, spec):
-    """Return a streaming dataset for `spec` if one variant yields a DECODABLE
-    clip. Tries the parquet-converted ref first (bypasses dead loading scripts),
-    then the default revision; passes an HF token if present (for gated repos)."""
+    """Return a streaming dataset for `spec` if some variant yields a DECODABLE
+    clip. Robust to config vs no-config and script-vs-parquet: tries the given
+    config and no-config, over the default revision then the parquet-converted
+    ref; passes an HF token if present (for gated repos)."""
     from datasets import load_dataset
-    tok = _hf_token(); last = None
-    for rev in ("refs/convert/parquet", None):
-        try:
-            kw = dict(split="train", streaming=True, cache_dir=cfg.hf_cache)
-            if rev: kw["revision"] = rev
-            if tok: kw["token"] = tok
-            ds = load_dataset(spec["repo"], spec["config"], **kw)
-            ex = next(iter(ds))                     # probe: must exist AND decode
-            wav, sr = _decode_audio(ex.get("audio"))
-            if wav is not None and len(wav) > 0:
-                log(f"[data] audio source OK: {spec['repo']}:{spec['config']}"
-                    f"{' @'+rev if rev else ''}")
-                return ds, spec
-            last = "probe clip did not decode"
-        except Exception as e:
-            last = e
-    log(f"[data] audio source unavailable {spec['repo']}:{spec['config']} ({last}).", err=True)
+    tok = _hf_token(); last = None; split = spec.get("split", "train")
+    conf = spec.get("config")
+    conf_variants = ["default", None] if conf in (None, "", "default") else [conf, None]
+    for conf_v in conf_variants:
+        for rev in (None, "refs/convert/parquet"):
+            try:
+                pos = [spec["repo"]] + ([conf_v] if conf_v else [])
+                kw = dict(split=split, streaming=True, cache_dir=cfg.hf_cache)
+                if rev: kw["revision"] = rev
+                if tok: kw["token"] = tok
+                ds = load_dataset(*pos, **kw)
+                ex = next(iter(ds))                 # probe: must exist AND decode
+                wav, sr = _decode_audio(ex.get("audio"))
+                if wav is not None and len(wav) > 0:
+                    log(f"[data] audio source OK: {spec['repo']}"
+                        f"[{conf_v or '-'}/{split}]{' @'+rev if rev else ''}")
+                    return ds, spec
+                last = "probe clip did not decode"
+            except Exception as e:
+                last = e
+    log(f"[data] audio source unavailable {spec['repo']}:{conf} ({last}).", err=True)
     return None, None
 
 
