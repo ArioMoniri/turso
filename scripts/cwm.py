@@ -92,6 +92,9 @@ class Config:
     jepa_horizons: tuple = (2, 4, 8)   # frames ahead (160/320/640 ms)
     ema_base: float = 0.996
     ema_final: float = 0.9999
+    jepa_var_w: float = float(_env("CWM_JEPA_VAR", "1.0"))    # VICReg variance (anti-collapse)
+    jepa_cov_w: float = float(_env("CWM_JEPA_COV", "0.04"))   # VICReg covariance (decorrelate)
+    jepa_collapse_std: float = 0.10    # warn (at log cadence) if online std stays below this
 
     # ---- optimization -------------------------------------------------------
     micro_batch: int = int(_env("CWM_MBS", "4"))
@@ -925,6 +928,7 @@ def _build_modules(cfg):
                                              cfg.rms_eps, cfg.rope_theta)
                                        for _ in range(cfg.jepa_pred_layers)])
             self.horizons = cfg.jepa_horizons
+            self.var_w = cfg.jepa_var_w; self.cov_w = cfg.jepa_cov_w
             for p in self.tgt.parameters():
                 p.requires_grad_(False)
             self.inp_t = nn.Linear(in_dim, d)
@@ -938,6 +942,20 @@ def _build_modules(cfg):
             for pt, ps in zip(self.inp_t.parameters(), self.inp.parameters()):
                 pt.mul_(m).add_(ps, alpha=1 - m)
 
+        def _vicreg(self, z):
+            # VICReg on the ONLINE embedding: variance hinge pushes per-dim std
+            # toward 1 (prevents representation collapse); covariance decorrelates
+            # dims. Computed in fp32. z: [B,T,D].
+            z = z.float().reshape(-1, z.shape[-1])          # [N, D]
+            std = torch.sqrt(z.var(dim=0) + 1e-4)           # per-dim std over N
+            var_loss = torch.mean(F.relu(1.0 - std))        # hinge -> std>=1
+            zc = z - z.mean(dim=0, keepdim=True)
+            N, D = zc.shape
+            cov = (zc.T @ zc) / max(1, N - 1)               # [D, D]
+            cov_off = cov - torch.diag_embed(torch.diagonal(cov))
+            cov_loss = cov_off.pow(2).sum() / D
+            return var_loss, cov_loss, std.mean().item()
+
         def forward(self, lat):
             # lat: [B, T, in_dim] user-stream continuous latents.
             # Match the module's own (bf16 on GPU) dtype — the latents arrive as
@@ -948,14 +966,16 @@ def _build_modules(cfg):
             with torch.no_grad():
                 t = self.inp_t(lat)
                 for b in self.tgt: t = b(t, causal=False)
-            loss = 0.0; T = lat.shape[1]
+            inv = c.new_zeros(()); T = lat.shape[1]
             for k in self.horizons:
                 if T <= k: continue
                 p = c[:, :T - k]
                 for b in self.pred: p = b(p, causal=True)
-                target = t[:, k:].detach()
-                loss = loss + F.smooth_l1_loss(p, target)
-            std = c.detach().float().std(dim=(0, 1)).mean().item()
+                inv = inv + F.smooth_l1_loss(p, t[:, k:].detach())
+            # VICReg variance+covariance keeps the invariance term from being
+            # minimized by collapsing the representation to a constant.
+            var_loss, cov_loss, std = self._vicreg(c)
+            loss = inv + self.var_w * var_loss + self.cov_w * cov_loss
             return loss, std
 
     class Rollout(nn.Module):
@@ -1191,8 +1211,6 @@ def train_stage(cfg, stage, resume=False, max_seconds=None):
                     lj, jstd = model.jepa(L)
                     loss = loss + cfg.lambda_jepa * lj
                     parts["jepa"] = float(lj.detach()); parts["jepa_std"] = round(jstd, 3)
-                    if jstd < 0.05:
-                        alert(f"JEPA latent std low ({jstd:.3f}) -> collapse risk")
                 if flags["rollout"] and aux_on:
                     lr_ = model.rollout(h)
                     loss = loss + cfg.lambda_rollout * lr_
@@ -1234,7 +1252,13 @@ def train_stage(cfg, stage, resume=False, max_seconds=None):
                     + " ".join(f"{k}={v}" for k, v in parts.items()))
                 write_json(Path(cfg.log_dir) / f"metrics_{stage}.jsonl.last",
                            {"step": step, "loss": loss.item(), **parts, "mfu": mfu})
-                if mfu < cfg.min_mfu and step > 200:
+                # throttled collapse check: only after aux is on, once per log step
+                js = parts.get("jepa_std")
+                if js is not None and step >= warm_aux + 500 and js < cfg.jepa_collapse_std:
+                    alert(f"JEPA online std {js} < {cfg.jepa_collapse_std} despite VICReg "
+                          f"— raise CWM_JEPA_VAR (now {cfg.jepa_var_w})")
+                # MFU note is expected-low on audio stages (short 256-frame seqs)
+                if mfu < cfg.min_mfu and step > 200 and flags["text"]:
                     alert(f"MFU {mfu:.2f} < {cfg.min_mfu} — throughput low")
             if time.time() - last_save > cfg.save_secs:
                 save_ckpt(cfg, stage, model, opt, sched, step, best); last_save = time.time()
