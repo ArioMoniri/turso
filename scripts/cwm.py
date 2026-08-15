@@ -108,10 +108,18 @@ class Config:
 
     # ---- data budgets (auto-scaled to free disk at runtime) -----------------
     text_datasets: tuple = ("HuggingFaceFW/fineweb-2",)  # config 'tur_Latn'
-    audio_datasets: tuple = ("mozilla-foundation/common_voice_17_0",)  # 'tr'
+    # Audio sources tried in order (first that yields decodable clips wins). The
+    # mozilla-foundation CV repos are gated loading-scripts that modern `datasets`
+    # can't stream, so we prefer the ungated parquet mirror + FLEURS (wav) and only
+    # fall back to gated CV (needs HF_TOKEN + accepted terms). Override with
+    # CWM_AUDIO_SPECS="repo:config:textcol,repo:config:textcol".
+    audio_specs: str = _env("CWM_AUDIO_SPECS",
+        "fsicoli/common_voice_17_0:tr:sentence"
+        ",google/fleurs:tr_tr:transcription"
+        ",mozilla-foundation/common_voice_17_0:tr:sentence")
     target_audio_hours: int = int(_env("CWM_AUDIO_H", "2000"))
     target_text_tokens: int = int(_env("CWM_TEXT_TOK", str(30_000_000_000)))
-    disk_reserve_gb: int = int(_env("CWM_DISK_RESERVE", "80"))
+    disk_reserve_gb: int = int(_env("CWM_DISK_RESERVE", "150"))  # shared SSD: keep headroom
     ckpt_budget_gb: int = int(_env("CWM_CKPT_BUDGET", "300"))
 
     # ---- dynamic resource guard thresholds (percent) ------------------------
@@ -601,31 +609,87 @@ def build_text_shards(cfg=CFG, target_tokens=None):
     log(f"[data] text shards: {man['tokens']} tokens in {len(man['shards'])} shards.")
 
 
+def _hf_token():
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
+
+def _audio_specs(cfg):
+    specs = []
+    for tok in cfg.audio_specs.split(","):
+        p = tok.strip().split(":")
+        if not p or not p[0]:
+            continue
+        specs.append({"repo": p[0], "config": p[1] if len(p) > 1 else "tr",
+                      "text": p[2] if len(p) > 2 else None})
+    return specs
+
+
+def _text_of(ex, key):
+    for k in ([key] if key else []) + ["sentence", "transcription", "text", "raw_transcription"]:
+        if k and ex.get(k):
+            return str(ex[k])
+    return ""
+
+
+def _open_audio_stream(cfg, spec):
+    """Return a streaming dataset for `spec` if one variant yields a DECODABLE
+    clip. Tries the parquet-converted ref first (bypasses dead loading scripts),
+    then the default revision; passes an HF token if present (for gated repos)."""
+    from datasets import load_dataset
+    tok = _hf_token(); last = None
+    for rev in ("refs/convert/parquet", None):
+        try:
+            kw = dict(split="train", streaming=True, cache_dir=cfg.hf_cache)
+            if rev: kw["revision"] = rev
+            if tok: kw["token"] = tok
+            ds = load_dataset(spec["repo"], spec["config"], **kw)
+            ex = next(iter(ds))                     # probe: must exist AND decode
+            wav, sr = _decode_audio(ex.get("audio"))
+            if wav is not None and len(wav) > 0:
+                log(f"[data] audio source OK: {spec['repo']}:{spec['config']}"
+                    f"{' @'+rev if rev else ''}")
+                return ds, spec
+            last = "probe clip did not decode"
+        except Exception as e:
+            last = e
+    log(f"[data] audio source unavailable {spec['repo']}:{spec['config']} ({last}).", err=True)
+    return None, None
+
+
 def build_audio_shards(cfg=CFG, target_hours=None):
-    """Mimi-encode Turkish speech into int16 code shards [K, T] (resumable)."""
+    """Mimi-encode Turkish speech into int16 code shards [K, T] (resumable).
+    Robust to gated/script datasets: picks the first source that streams AND
+    decodes; records it so resume stays on the same source."""
     import numpy as np
     target_h = target_hours or cfg.target_audio_hours
     man_path = Path(cfg.shard_dir) / "audio_manifest.json"
-    man = read_json(man_path, None) or {"hours": 0.0, "shards": [], "consumed": 0}
-    man.setdefault("consumed", 0)
+    man = read_json(man_path, None) or {"hours": 0.0, "shards": [], "consumed": 0, "source": ""}
+    man.setdefault("consumed", 0); man.setdefault("source", "")
     if man["hours"] >= target_h:
         log(f"[data] audio shards done ({man['hours']:.1f} h)."); return
     free = disk_free_gb(cfg.data_dir)
-    # Mimi codes ~ 8 codebooks * 12.5 Hz * 2B = 200 B/s -> 0.72 MB/h (+ latents)
     cap_h = int(max(0, free - cfg.disk_reserve_gb) * 1e9 / (5 * 1024 * 1024))
     target_h = min(target_h, man["hours"] + cap_h)
     log(f"[data] Mimi-encoding audio up to {target_h} h (free {free:.0f}GB, "
         f"resume-skip {man['consumed']} clips) ...")
+    # pick a working source; prefer the previously-chosen one on resume
+    specs = _audio_specs(cfg)
+    specs.sort(key=lambda s: 0 if f"{s['repo']}:{s['config']}" == man["source"] else 1)
+    ds = None; spec = None
+    for cand in specs:
+        ds, spec = _open_audio_stream(cfg, cand)
+        if ds is not None:
+            break
+    if ds is None:
+        alert("no audio source is reachable/decodable. Set HF_TOKEN (and accept the "
+              "Common Voice terms on huggingface.co), or set CWM_AUDIO_SPECS to a "
+              "dataset you can stream. Audio shards left empty.")
+        write_json(man_path, man); return
+    man["source"] = f"{spec['repo']}:{spec['config']}"; text_key = spec.get("text")
+    write_json(man_path, man)
     mimi = MimiWrap(cfg)
-    from datasets import load_dataset, Audio
     sidx = len(man["shards"]); seen = 0
     try:
-        ds = load_dataset(cfg.audio_datasets[0], "tr", split="train",
-                          streaming=True, cache_dir=cfg.hf_cache)
-        try:
-            ds = ds.cast_column("audio", Audio(decode=False))
-        except Exception:
-            pass
         for ex in ds:
             if man["hours"] >= target_h:
                 break
@@ -642,8 +706,7 @@ def build_audio_shards(cfg=CFG, target_hours=None):
             except Exception as e:
                 log(f"[data] encode skip ({e}).", err=True); continue
             fp = Path(cfg.shard_dir) / f"audio_{sidx:07d}.npz"
-            np.savez_compressed(fp, codes=codes, lat=lat,
-                                text=str(ex.get("sentence", "")))
+            np.savez_compressed(fp, codes=codes, lat=lat, text=_text_of(ex, text_key))
             man["shards"].append(fp.name)
             man["hours"] += codes.shape[1] / cfg.frame_hz / 3600.0
             sidx += 1
@@ -1378,8 +1441,19 @@ def _cfg_hash(cfg):
                         .encode()).hexdigest()[:8]
 
 
+def _clean_exit(code):
+    """Exit WITHOUT running interpreter finalization. torch/moshi background
+    threads can crash the GIL teardown (PyGILState_Release core dump) when a
+    normal SystemExit unwinds through them, so we flush and hard-exit instead."""
+    try:
+        sys.stdout.flush(); sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(code)
+
+
 def die(msg):
-    log(msg, err=True); raise SystemExit(1)
+    log(msg, err=True); runlog({"event": "die", "msg": msg[:200]}); _clean_exit(1)
 
 
 # =========================================================================== #
@@ -1411,10 +1485,19 @@ def main():
         if cmd == "eval":       return cmd_eval(CFG, args.stage)
         if cmd == "auto":       return cmd_auto(CFG, args)
 
-    if "--no-heal" in sys.argv or cmd in ("doctor", "setup", "smoke", "bench"):
-        run()
-    else:
-        supervise(run)
+    try:
+        if "--no-heal" in sys.argv or cmd in ("doctor", "setup", "smoke", "bench"):
+            run()
+        else:
+            supervise(run)
+    except SystemExit as e:
+        _clean_exit(int(e.code) if isinstance(e.code, int) else (0 if e.code in (None, 0) else 1))
+    except KeyboardInterrupt:
+        log("interrupted (Ctrl-C).", err=True); _clean_exit(130)
+    except BaseException as e:
+        log(f"[fatal] {type(e).__name__}: {str(e)[:300]}", err=True)
+        runlog({"event": "fatal", "err": type(e).__name__}); _clean_exit(1)
+    _clean_exit(0)
 
 
 if __name__ == "__main__":
