@@ -114,9 +114,9 @@ class Config:
     # fall back to gated CV (needs HF_TOKEN + accepted terms). Override with
     # CWM_AUDIO_SPECS="repo:config:textcol,repo:config:textcol".
     audio_specs: str = _env("CWM_AUDIO_SPECS",
-        "fsicoli/common_voice_17_0:tr:sentence"
-        ",google/fleurs:tr_tr:transcription"
-        ",mozilla-foundation/common_voice_17_0:tr:sentence")
+        "ysdede/commonvoice_17_tr_fixed:train:transcription"   # native parquet, ungated, TR
+        ",google/fleurs:tr_tr:transcription"                    # parquet fallback (~10h)
+        ",mozilla-foundation/common_voice_17_0:tr:sentence")    # gated: needs HF_TOKEN
     target_audio_hours: int = int(_env("CWM_AUDIO_H", "2000"))
     target_text_tokens: int = int(_env("CWM_TEXT_TOK", str(30_000_000_000)))
     disk_reserve_gb: int = int(_env("CWM_DISK_RESERVE", "150"))  # shared SSD: keep headroom
