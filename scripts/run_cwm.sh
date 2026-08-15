@@ -80,15 +80,25 @@ ensure_venv() {
 }
 
 fetch_code() {
-  # Prefer a repo-local copy if we're running from inside the checkout.
+  # A local cwm.py next to this script wins (drop a commit-pinned copy here to
+  # bypass the network entirely). Otherwise fetch FRESH — the raw.githubusercontent
+  # "main" URL is CDN-cached ~5 min, so we hit the GitHub API (not cached) first
+  # and fall back to a cache-busted raw URL. Pin a ref/commit with CWM_REF.
   local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if [[ -f "$here/cwm.py" ]]; then
-    cp -f "$here/cwm.py" "$CODE"; log "using local scripts/cwm.py"
+    cp -f "$here/cwm.py" "$CODE"; log "using local cwm.py at $here/cwm.py"
     return
   fi
-  log "fetching cwm.py from $RAW_BASE"
-  curl -fsSL "$RAW_BASE/cwm.py" -o "$CODE.tmp" && mv -f "$CODE.tmp" "$CODE" \
-    || die "download failed ($RAW_BASE/cwm.py). Set CWM_RAW_BASE or copy cwm.py to $WORK."
+  local ref="${CWM_REF:-main}" cb="cb=$(date +%s)$$"
+  if curl -fsSL -H "Accept: application/vnd.github.raw" \
+       "https://api.github.com/repos/ArioMoniri/turso/contents/scripts/cwm.py?ref=${ref}&${cb}" \
+       -o "$CODE.tmp" 2>/dev/null && [[ -s "$CODE.tmp" ]]; then
+    mv -f "$CODE.tmp" "$CODE"; log "fetched cwm.py via GitHub API (ref=${ref}, fresh)"
+    return
+  fi
+  log "API fetch failed; trying cache-busted raw ($RAW_BASE)"
+  curl -fsSL "$RAW_BASE/cwm.py?${cb}" -o "$CODE.tmp" && [[ -s "$CODE.tmp" ]] && mv -f "$CODE.tmp" "$CODE" \
+    || die "download failed. Set CWM_REF=<commit>, or drop cwm.py next to run_cwm.sh ($here/cwm.py)."
 }
 
 hf_login_hint() {
