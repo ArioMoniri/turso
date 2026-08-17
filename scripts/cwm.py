@@ -1168,6 +1168,7 @@ def train_stage(cfg, stage, resume=False, max_seconds=None):
     # per-stage tokens/step for an honest MFU (audio stages run 256 frames, not seq_len)
     stage_tok = cfg.seq_len if flags["text"] else 256
     t0 = time.time(); last_save = time.time(); micro = 0; nonfinite_window = False
+    start_step = step   # for a correct it/s on RESUME (steps done THIS session)
     opt.zero_grad(set_to_none=True)
     log(f"=== TRAIN stage={stage} flags={flags} from step {step} ===")
     runlog({"event": "train_start", "stage": stage, "step": step,
@@ -1245,10 +1246,12 @@ def train_stage(cfg, stage, resume=False, max_seconds=None):
                 log("[guard] stopping phase to protect the box; resume with --resume."); return "stopped"
             if step % cfg.log_steps == 0:
                 used, tot = vram_used_total()
-                its = (step) / max(1e-6, time.time() - t0)
+                its = (step - start_step) / max(1e-6, time.time() - t0)
                 mfu = _mfu(cfg, its, stage_tok)
+                eta_h = (cfg.total_steps - step) / max(1e-6, its) / 3600
                 log(f"stage={stage} step={step}/{cfg.total_steps} loss={loss.item():.4f} "
-                    f"lr={sched.get_last_lr()[0]:.2e} vram={used:.1f}/{tot:.1f} {its:.3f}it/s mfu={mfu:.2f} "
+                    f"lr={sched.get_last_lr()[0]:.2e} vram={used:.1f}/{tot:.1f} {its:.3f}it/s "
+                    f"mfu={mfu:.2f} eta={eta_h:.1f}h "
                     + " ".join(f"{k}={v}" for k, v in parts.items()))
                 write_json(Path(cfg.log_dir) / f"metrics_{stage}.jsonl.last",
                            {"step": step, "loss": loss.item(), **parts, "mfu": mfu})
