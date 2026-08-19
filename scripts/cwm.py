@@ -99,6 +99,9 @@ class Config:
     jepa_var_w: float = float(_env("CWM_JEPA_VAR", "1.0"))    # VICReg variance (anti-collapse)
     jepa_cov_w: float = float(_env("CWM_JEPA_COV", "0.04"))   # VICReg covariance (decorrelate)
     jepa_collapse_std: float = 0.10    # warn (at log cadence) if online std stays below this
+    # ---- P1 coupled-JEPA (interlocutor prediction, trunk-coupled) ----------------
+    jepa_tgt_dim: int = int(_env("CWM_JEPA_TGT", "512"))      # Mimi dequant partner-latent dim
+    jepa_twin_layers: int = int(_env("CWM_JEPA_TWIN", "2"))   # data2vec teacher-twin depth
 
     # ---- optimization -------------------------------------------------------
     micro_batch: int = int(_env("CWM_MBS", "4"))
@@ -996,6 +999,102 @@ def _build_modules(cfg):
             r = self.adapter(hidden[:, :-4])
             return F.smooth_l1_loss(r, hidden[:, 4:].detach())
 
+    class CoupledJEPA(nn.Module):
+        """P1: trunk-coupled interlocutor JEPA (I-JEPA / data2vec style).
+        The predictor consumes the CORE hidden `h_ctx` (the listening state), so
+        its gradient flows into the shared decoder trunk — the fix for the flaw
+        where the old side-tower JEPA never touched the generator. The target is
+        the PARTNER stream's FUTURE continuous latent (Mimi dequant, all 8
+        codebooks), lifted by an EMA teacher (stop-grad, feature-normalized), so
+        it carries prosody/energy/VAD and is not redundant with the cb0 CE head.
+        `role` selects partner / self / shuffled(placebo) for the factorial study."""
+        def __init__(self, cfg, tgt_in):
+            super().__init__()
+            d, H, KV = cfg.d_model, cfg.n_heads, cfg.n_kv_heads
+            self.pred = nn.ModuleList([Block(d, H, KV, cfg.rms_eps, cfg.rope_theta)
+                                       for _ in range(cfg.jepa_pred_layers)])
+            self.pred_head = nn.Linear(d, d, bias=False)
+            self.tgt_in = nn.Linear(tgt_in, d)
+            self.twin = nn.ModuleList([Block(d, H, KV, cfg.rms_eps, cfg.rope_theta)
+                                       for _ in range(cfg.jepa_twin_layers)])
+            self.tgt_in_ema = nn.Linear(tgt_in, d)
+            self.twin_ema = nn.ModuleList([Block(d, H, KV, cfg.rms_eps, cfg.rope_theta)
+                                           for _ in range(cfg.jepa_twin_layers)])
+            for p in self.tgt_in_ema.parameters():
+                p.requires_grad_(False)
+            for b in self.twin_ema:
+                for p in b.parameters():
+                    p.requires_grad_(False)
+            self._ema_init = False
+            self.horizons = cfg.jepa_horizons
+            self.var_w, self.cov_w = cfg.jepa_var_w, cfg.jepa_cov_w
+
+        @torch.no_grad()
+        def ema_update(self, mom):
+            src = list(self.tgt_in.parameters()) + [p for b in self.twin for p in b.parameters()]
+            dst = list(self.tgt_in_ema.parameters()) + [p for b in self.twin_ema for p in b.parameters()]
+            if not self._ema_init:                         # first call: hard copy
+                for d_, s_ in zip(dst, src):
+                    d_.copy_(s_.detach())
+                self._ema_init = True
+                return
+            for d_, s_ in zip(dst, src):
+                d_.mul_(mom).add_(s_.detach(), alpha=1 - mom)
+
+        def _teacher(self, lat):                           # stop-grad EMA target
+            with torch.no_grad():
+                t = self.tgt_in_ema(lat)
+                for b in self.twin_ema:
+                    t = b(t, causal=False)
+                t = F.layer_norm(t, (t.shape[-1],))        # data2vec target norm
+            return t
+
+        def _student(self, lat):
+            s = self.tgt_in(lat)
+            for b in self.twin:
+                s = b(s, causal=False)
+            return s
+
+        def _vicreg(self, z):
+            z = z.float().reshape(-1, z.shape[-1])
+            std = torch.sqrt(z.var(dim=0) + 1e-4)
+            var_loss = torch.mean(F.relu(1.0 - std))
+            zc = z - z.mean(dim=0, keepdim=True)
+            cov = (zc.T @ zc) / max(1, zc.shape[0] - 1)
+            cov_loss = (cov - torch.diag_embed(torch.diagonal(cov))).pow(2).sum() / zc.shape[1]
+            return var_loss, cov_loss, std.mean().item()
+
+        def forward(self, h_ctx, ptn_lat, role="partner", vad_ptn=None):
+            # h_ctx: [B,T,d] core hidden. ptn_lat: [B,T,tgt_in] partner future latent.
+            lat = ptn_lat.to(self.tgt_in.weight.dtype)
+            if role == "self":
+                pass                                       # caller passes own latent instead
+            elif role == "shuffled":                       # placebo: destroy temporal structure
+                perm = torch.randperm(lat.shape[1], device=lat.device)
+                lat = lat[:, perm]
+            target = self._teacher(lat)                    # [B,T,d] stop-grad
+            student = self._student(lat)
+            loss = h_ctx.new_zeros(()); T = h_ctx.shape[1]
+            for k in self.horizons:
+                if T <= k: continue
+                p = h_ctx[:, :T - k].to(self.pred_head.weight.dtype)
+                for b in self.pred:
+                    p = b(p, causal=True)
+                p = self.pred_head(p)
+                l = F.smooth_l1_loss(p, target[:, k:].detach(), reduction="none").mean(-1)
+                if vad_ptn is not None:                     # listen-mask: weight by partner speech
+                    w = vad_ptn[:, k:T].to(l.dtype)
+                    l = (l * w).sum() / w.sum().clamp_min(1.0)
+                else:
+                    l = l.mean()
+                loss = loss + l
+            # keep the teacher-twin meaningful (data2vec self-distill) + anti-collapse
+            loss = loss + F.smooth_l1_loss(F.layer_norm(student, (student.shape[-1],)),
+                                           target.detach())
+            var_loss, cov_loss, std = self._vicreg(student)
+            loss = loss + self.var_w * var_loss + self.cov_w * cov_loss
+            return loss, std
+
     class CWM(nn.Module):
         def __init__(self, cfg, jepa_in):
             super().__init__()
@@ -1003,7 +1102,7 @@ def _build_modules(cfg):
             self.core = Core(cfg); self.depth = Depth(cfg)
             self.jepa = JEPA(cfg, jepa_in); self.rollout = Rollout(cfg)
 
-    return {"CWM": CWM, "modules": locals()}
+    return {"CWM": CWM, "CoupledJEPA": CoupledJEPA, "modules": locals()}
 
 
 def _enable_fast_backends():
