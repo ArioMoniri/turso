@@ -1380,6 +1380,109 @@ def cmd_eval(cfg, stage):
 
 
 # =========================================================================== #
+#  GENERATE (qualitative sanity check: TR text + speech continuation)          #
+# =========================================================================== #
+def _sample_logits(logits, temperature=0.9, top_k=50):
+    import torch
+    logits = logits.float() / max(1e-5, temperature)
+    if top_k and top_k < logits.shape[-1]:
+        v, _ = torch.topk(logits, top_k)
+        logits = logits.masked_fill(logits < v[..., -1:], float("-inf"))
+    probs = torch.softmax(logits, dim=-1)
+    return torch.multinomial(probs, 1)[..., 0]
+
+
+def _depth_generate(depth, hframe, temperature, top_k):
+    """Autoregressively sample acoustic codebooks cb1..cb7 for one frame from the
+    core hidden, mirroring the teacher-forced training layout."""
+    import torch
+    x = depth.proj(hframe).unsqueeze(1)                 # [1,1,d]
+    out = []
+    for k in range(depth.K):
+        xk = x
+        for b in depth.blocks:
+            xk = b(xk, causal=True)
+        xk = depth.norm(xk)
+        a = _sample_logits(depth.heads[k](xk[:, -1]), temperature, top_k)  # [1]
+        out.append(a)
+        if k < depth.K - 1:
+            x = torch.cat([x, depth.cb_emb[k](a).unsqueeze(1)], dim=1)
+    return torch.stack(out, dim=1)                      # [1, K]
+
+
+def cmd_generate(cfg, stage, prompt, max_new, do_audio, seconds, temperature, top_k):
+    import torch
+    import numpy as np
+    log(f"=== GENERATE stage={stage} ===")
+    model = build_model(cfg, _infer_jepa_dim(cfg, cfg.jepa_lat_dim))
+    s, _ = load_ckpt(cfg, stage, model)
+    if s == 0:
+        log("[gen] no checkpoint for that stage.", err=True); return
+    model.eval()
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    out_dir = Path(cfg.root) / "samples"; out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- text ---------------------------------------------------------------
+    sp = load_tokenizer(cfg)
+    ids = sp.encode(prompt) if prompt else [sp.bos_id() if sp.bos_id() >= 0 else 2]
+    tok = torch.tensor([ids], device=dev)
+    with torch.no_grad():
+        for _ in range(max_new):
+            typ = torch.zeros_like(tok)
+            _, tl, _ = model.core(tok[:, -cfg.seq_len:], typ[:, -cfg.seq_len:])
+            nxt = _sample_logits(tl[0, -1], temperature, top_k).view(1, 1)
+            tok = torch.cat([tok, nxt], dim=1)
+            if int(nxt) == sp.eos_id():
+                break
+    text = sp.decode(tok[0].tolist())
+    (out_dir / f"gen_{stage}_text.txt").write_text(text, encoding="utf-8")
+    log(f"[gen] TEXT ({stage}):\n{text}\n")
+
+    if not do_audio:
+        return
+    # ---- speech continuation (prime on a real clip, let the model continue) --
+    mimi = MimiWrap(cfg)
+    try:
+        mimi.load()
+    except Exception as e:
+        log(f"[gen] Mimi unavailable, skipping audio ({e}).", err=True); return
+    man = read_json(Path(cfg.shard_dir) / "audio_manifest.json", {"shards": []})
+    shards = man.get("shards", [])
+    n_prime = 12                                        # ~1s of real audio to prime
+    prime_codes = None
+    if shards:
+        z = np.load(Path(cfg.shard_dir) / shards[len(shards) // 2], allow_pickle=True)
+        prime_codes = np.asarray(z["codes"])[:, :n_prime]   # [8, n_prime]
+        sem = torch.tensor(prime_codes[0][None, :].astype("int64"), device=dev)
+        log(f"[gen] priming on {n_prime} real frames from {shards[len(shards)//2]}")
+    else:
+        sem = torch.tensor([[np.random.randint(0, cfg.codebook_size)]], device=dev)
+    n_frames = max(1, int(seconds * cfg.frame_hz))
+    gen_frames = []
+    with torch.no_grad():
+        for _ in range(n_frames):
+            typ = torch.ones_like(sem)
+            h, _, sl = model.core(sem[:, -cfg.seq_len:], typ[:, -cfg.seq_len:])
+            cb17 = _depth_generate(model.depth, h[:, -1], temperature, top_k)  # [1,7]
+            cb0 = sem[:, -1:]                            # current-frame semantic
+            gen_frames.append(torch.cat([cb0, cb17], dim=1)[0].to("cpu").numpy())
+            nxt = _sample_logits(sl[0, -1], temperature, top_k).view(1, 1)
+            sem = torch.cat([sem, nxt], dim=1)
+    gen = np.stack(gen_frames, axis=1).astype("int64")  # [8, n_frames]
+    codes = np.concatenate([prime_codes, gen], axis=1) if prime_codes is not None else gen
+    try:
+        wav, sr = mimi.decode(codes)
+        import soundfile as sf
+        wpath = out_dir / f"gen_{stage}_audio.wav"
+        sf.write(str(wpath), np.asarray(wav, dtype="float32"), sr)
+        secs = codes.shape[1] / cfg.frame_hz
+        log(f"[gen] AUDIO ({stage}): {secs:.1f}s ({'primed+' if prime_codes is not None else ''}"
+            f"generated) -> {wpath}")
+    except Exception as e:
+        log(f"[gen] audio decode failed: {e}", err=True)
+
+
+# =========================================================================== #
 #  AUTO ROADMAP (gated, self-healing, resumable)                               #
 # =========================================================================== #
 def cmd_auto(cfg, args):
@@ -1541,6 +1644,14 @@ def main():
         sub.add_parser(c)
     t = sub.add_parser("train"); t.add_argument("--stage", required=True)
     e = sub.add_parser("eval"); e.add_argument("--stage", required=True)
+    g = sub.add_parser("generate")
+    g.add_argument("--stage", default="b3")
+    g.add_argument("--prompt", default="Merhaba, bugün hava çok güzel ve")
+    g.add_argument("--max-new", type=int, default=80, dest="max_new")
+    g.add_argument("--audio", action="store_true")
+    g.add_argument("--seconds", type=float, default=4.0)
+    g.add_argument("--temperature", type=float, default=0.9)
+    g.add_argument("--top-k", type=int, default=50, dest="top_k")
     sub.add_parser("auto")
     args = p.parse_args()
     cmd = args.cmd or "auto"
@@ -1555,10 +1666,12 @@ def main():
         if cmd == "train":      return train_stage(CFG, args.stage, resume=args.resume,
                                                    max_seconds=args.max_seconds)
         if cmd == "eval":       return cmd_eval(CFG, args.stage)
+        if cmd == "generate":   return cmd_generate(CFG, args.stage, args.prompt, args.max_new,
+                                                    args.audio, args.seconds, args.temperature, args.top_k)
         if cmd == "auto":       return cmd_auto(CFG, args)
 
     try:
-        if "--no-heal" in sys.argv or cmd in ("doctor", "setup", "smoke", "bench"):
+        if "--no-heal" in sys.argv or cmd in ("doctor", "setup", "smoke", "bench", "generate", "eval"):
             run()
         else:
             supervise(run)
