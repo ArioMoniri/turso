@@ -81,6 +81,10 @@ class Config:
     jepa_pred_layers: int = int(_env("CWM_JEPA_PRED", "3"))
     jepa_lat_dim: int = int(_env("CWM_JEPA_LAT", "128"))   # JEPA target-space dim
     seq_len: int = int(_env("CWM_SEQ", "4096"))
+    # ---- research-workhorse efficiency knobs (off by default -> b3 path intact) ---
+    # CWM-S preset: CWM_DMODEL=768 CWM_LAYERS=16 CWM_HEADS=12 CWM_KV=3 CWM_DEPTH=2 CWM_TIE=1
+    tie_embeddings: bool = _env("CWM_TIE", "0") == "1"     # tie text_emb<->text_head
+    use_compile: bool = _env("CWM_COMPILE", "0") == "1"    # torch.compile core+depth (GPU)
     rope_theta: float = 1e4
     rms_eps: float = 1e-5
 
@@ -871,6 +875,8 @@ def _build_modules(cfg):
             self.norm = RMSNorm(d, cfg.rms_eps)
             self.text_head = nn.Linear(d, V, bias=False)
             self.sem_head = nn.Linear(d, S, bias=False)
+            if getattr(cfg, "tie_embeddings", False):     # weight tying (nn.Linear + Embedding both [V,d])
+                self.text_head.weight = self.text_emb.weight
 
         def embed(self, tok, typ):
             e = torch.where(typ.unsqueeze(-1).bool(),
@@ -1000,13 +1006,38 @@ def _build_modules(cfg):
     return {"CWM": CWM, "modules": locals()}
 
 
+def _enable_fast_backends():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            try:
+                torch.backends.cuda.enable_flash_sdp(True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def build_model(cfg, jepa_in=512):
     import torch
+    _enable_fast_backends()
     parts = _build_modules(cfg)
     model = parts["CWM"](cfg, jepa_in).to("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(torch.bfloat16) if torch.cuda.is_available() else model
     n = sum(p.numel() for p in model.parameters())
-    log(f"[model] CWM built: {n/1e6:.1f}M params (jepa_in={jepa_in})")
+    tied = " tied" if getattr(cfg, "tie_embeddings", False) else ""
+    log(f"[model] CWM built: {n/1e6:.1f}M params (jepa_in={jepa_in}{tied})")
+    # torch.compile the hot paths only (keep jepa/rollout + self-heal control-flow eager)
+    if getattr(cfg, "use_compile", False) and torch.cuda.is_available():
+        try:
+            model.core = torch.compile(model.core, mode="max-autotune-no-cudagraphs", dynamic=False)
+            model.depth = torch.compile(model.depth, mode="max-autotune-no-cudagraphs", dynamic=False)
+            log("[model] torch.compile enabled on core+depth")
+        except Exception as e:
+            log(f"[model] torch.compile unavailable ({e}); running eager.", err=True)
     return model
 
 
